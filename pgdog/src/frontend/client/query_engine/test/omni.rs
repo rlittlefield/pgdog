@@ -392,3 +392,74 @@ async fn test_omni_write_barrier_parks_writes() {
         .await;
     client.read_until('Z').await.unwrap();
 }
+
+/// A keyed write barrier (MOVE KEYS) parks writes on sharded tables
+/// that name no sharding key (a broadcast can touch moving rows),
+/// while reads and omnisharded writes flow.
+#[tokio::test]
+async fn test_keyed_write_barrier_parks_unkeyed_sharded_writes() {
+    use crate::backend::fleet::barrier;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    let mut client = TestClient::new_sharded(Parameters::default()).await;
+
+    client
+        .send_simple(Query::new(
+            "CREATE TABLE IF NOT EXISTS sharded (id BIGINT PRIMARY KEY, value TEXT)",
+        ))
+        .await;
+    client.read_until('Z').await.unwrap();
+    client
+        .send_simple(Query::new(
+            "CREATE TABLE IF NOT EXISTS sharded_omni (id BIGINT PRIMARY KEY, value TEXT)",
+        ))
+        .await;
+    client.read_until('Z').await.unwrap();
+
+    // The database name for the sharded test cluster.
+    let database = "pgdog";
+    barrier::start_keys(database, &["some_moving_key".to_string()]);
+
+    // Reads flow while the keyed barrier is armed.
+    client
+        .send_simple(Query::new("SELECT * FROM sharded"))
+        .await;
+    client.read_until('Z').await.unwrap();
+
+    // Omnisharded writes flow: the omni barrier is separate.
+    client
+        .send_simple(Query::new("DELETE FROM sharded_omni"))
+        .await;
+    client.read_until('Z').await.unwrap();
+
+    // A sharded write naming no key parks: it broadcasts, and a
+    // broadcast can touch moving rows. The WHERE clause avoids the
+    // sharding column (id) and matches nothing, so concurrent tests
+    // sharing the table are unaffected. Run it on its own task so the
+    // parked future isn't cancelled.
+    client
+        .send(Query::new(
+            "DELETE FROM sharded WHERE value = 'keyed_barrier_test_no_such_row'",
+        ))
+        .await;
+    let handle = tokio::spawn(async move {
+        client.try_process().await.unwrap();
+        client.read_until('Z').await.unwrap();
+        client
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !handle.is_finished(),
+        "an unkeyed sharded write should park at the keyed barrier"
+    );
+
+    // Release: the parked write completes. The `sharded` table is the
+    // shared test fixture; it stays (the parked DELETE only removed
+    // this test's rows).
+    barrier::stop_keys(database);
+    timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the parked write should resume after release")
+        .unwrap();
+}

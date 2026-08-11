@@ -80,132 +80,171 @@ impl QueryEngine {
             return Ok(false);
         }
 
-        let cluster = match self.backend.cluster() {
-            Ok(cluster) => cluster,
-            _ => {
-                return Ok(true);
-            }
-        };
+        if self.backend.cluster().is_err() {
+            return Ok(true);
+        }
 
-        let router_context = RouterContext::new(
-            context.client_request,
-            cluster,
-            context.params,
-            context.transaction,
-            context.sticky,
-        )?;
-        let mut result = self.router.query(router_context).map(|_| ());
+        // Routes the request, parking at write barriers when one is
+        // armed. A statement released from a barrier re-routes from
+        // scratch: it was routed with the placement from before the
+        // barrier armed, and a MOVE KEYS cutover invalidates the
+        // lookup cache while writes are parked, so the fresh pass
+        // reads the new placement. The cluster is re-borrowed per pass
+        // so parking (which mutates engine state) ends the borrow.
+        'routing: loop {
+            let cluster = match self.backend.cluster() {
+                Ok(cluster) => cluster,
+                _ => {
+                    return Ok(true);
+                }
+            };
 
-        // Resolve sharding key lookups that missed the cache and route
-        // the query once more, with the translations handed to the
-        // second pass through the router context. Parsing is
-        // deterministic, so the second pass asks for exactly the keys
-        // the first pass collected and can't miss: no retry loop. A
-        // lookup that can't be resolved fails the statement: routing
-        // by the untranslated value could put it on the wrong shard.
-        if result.is_ok() {
-            let pending = self.router.command().route().pending_lookups().to_vec();
-            if !pending.is_empty() {
-                match lookup::resolve(cluster, pending).await {
-                    Ok(resolved) => {
-                        let router_context = RouterContext::new(
-                            context.client_request,
-                            cluster,
-                            context.params,
-                            context.transaction,
-                            context.sticky,
-                        )?
-                        .with_resolved_lookups(resolved);
-                        result = self.router.query(router_context).map(|_| ());
+            let router_context = RouterContext::new(
+                context.client_request,
+                cluster,
+                context.params,
+                context.transaction,
+                context.sticky,
+            )?;
+            let mut result = self.router.query(router_context).map(|_| ());
 
-                        // Defensive: can't happen unless routing stops
-                        // being deterministic.
-                        if result.is_ok()
-                            && !self.router.command().route().pending_lookups().is_empty()
-                        {
-                            self.error_response(
-                                context,
-                                ErrorResponse::sharding_key_lookup(
-                                    "lookups did not resolve routing",
-                                ),
-                            )
-                            .await?;
+            // Resolve sharding key lookups that missed the cache and route
+            // the query once more, with the translations handed to the
+            // second pass through the router context. Parsing is
+            // deterministic, so the second pass asks for exactly the keys
+            // the first pass collected and can't miss: no retry loop. A
+            // lookup that can't be resolved fails the statement: routing
+            // by the untranslated value could put it on the wrong shard.
+            if result.is_ok() {
+                let pending = self.router.command().route().pending_lookups().to_vec();
+                if !pending.is_empty() {
+                    match lookup::resolve(cluster, pending).await {
+                        Ok(resolved) => {
+                            let router_context = RouterContext::new(
+                                context.client_request,
+                                cluster,
+                                context.params,
+                                context.transaction,
+                                context.sticky,
+                            )?
+                            .with_resolved_lookups(resolved);
+                            result = self.router.query(router_context).map(|_| ());
+
+                            // Defensive: can't happen unless routing stops
+                            // being deterministic.
+                            if result.is_ok()
+                                && !self.router.command().route().pending_lookups().is_empty()
+                            {
+                                self.error_response(
+                                    context,
+                                    ErrorResponse::sharding_key_lookup(
+                                        "lookups did not resolve routing",
+                                    ),
+                                )
+                                .await?;
+                                return Ok(false);
+                            }
+                        }
+
+                        Err(response) => {
+                            self.error_response(context, response).await?;
                             return Ok(false);
                         }
                     }
-
-                    Err(response) => {
-                        self.error_response(context, response).await?;
-                        return Ok(false);
-                    }
                 }
             }
-        }
 
-        match result {
-            Ok(()) => {
-                let command = self.router.command();
-                context.client_request.route = Some(command.route().clone());
-                trace!(
-                    "routing {:#?} to {:#?}",
-                    context.client_request.messages, command,
-                );
+            match result {
+                Ok(()) => {
+                    let command = self.router.command();
 
-                // Apply post-parser rewrites, e.g. offset/limit.
-                if let Some(rewrite_result) = &context.rewrite_result {
-                    rewrite_result.apply_after_parser(context.client_request)?;
+                    // Only validate shard placement for requests that actually execute
+                    // a query. Bare protocol-control batches (e.g. a lone Sync or Flush)
+                    // route to a default/cross-shard target but must still be forwarded
+                    // to the already-connected backend to finish the exchange.
+                    if context.client_request.is_executable() {
+                        if Self::is_omnishard_unsafe(&self.backend, command, cluster) {
+                            self.error_response(context, ErrorResponse::omni_in_direct_to_shard())
+                                .await?;
+                            return Ok(false);
+                        }
+
+                        if Self::is_shard_switch(command, &self.backend) {
+                            self.error_response(context, ErrorResponse::direct_shard_mismatch())
+                                .await?;
+                            return Ok(false);
+                        }
+
+                        // Writes pause while the cluster changes underneath
+                        // them, before any server is checked out. Omnisharded
+                        // writes park for an ADD SHARD cutover: they must
+                        // reach every shard, including the one being swapped
+                        // in. Writes park for a MOVE KEYS cutover when they
+                        // name a paused sharding key, or name no key at all
+                        // on a sharded write (a broadcast can touch moving
+                        // rows). In-transaction writes are exempt: they
+                        // already hold server connections, and parking them
+                        // would deadlock against the drain; the cutover
+                        // timeout covers them.
+                        let waiter = if !context.in_transaction() {
+                            let route = self.router.command().route();
+                            if route.is_write() {
+                                if route.is_omnisharded() {
+                                    crate::backend::fleet::barrier::waiter(cluster.name())
+                                } else {
+                                    let keys = route.sharding_keys();
+                                    crate::backend::fleet::barrier::key_waiter(
+                                        cluster.name(),
+                                        keys,
+                                        keys.is_empty(),
+                                    )
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(waiter) = waiter {
+                            let state = self.get_state();
+                            self.set_state(State::Waiting);
+                            waiter.await;
+                            self.set_state(state);
+
+                            // Route again with the current placement.
+                            continue 'routing;
+                        }
+                    }
+
+                    // The route is final: attach it and apply post-parser
+                    // rewrites, e.g. offset/limit. Rewrites mutate the
+                    // request, so they only run once, after the last
+                    // routing pass.
+                    let command = self.router.command();
+                    context.client_request.route = Some(command.route().clone());
+                    trace!(
+                        "routing {:#?} to {:#?}",
+                        context.client_request.messages, command,
+                    );
+
+                    if let Some(rewrite_result) = &context.rewrite_result {
+                        rewrite_result.apply_after_parser(context.client_request)?;
+                    }
+
+                    break 'routing;
                 }
+                Err(RouterError::Parser(ParserError::OmniWriteWithDirective)) => {
+                    self.error_response(context, ErrorResponse::omni_write_with_directive())
+                        .await?;
 
-                // Only validate shard placement for requests that actually execute
-                // a query. Bare protocol-control batches (e.g. a lone Sync or Flush)
-                // route to a default/cross-shard target but must still be forwarded
-                // to the already-connected backend to finish the exchange.
-                if context.client_request.is_executable() {
-                    if Self::is_omnishard_unsafe(&self.backend, command, cluster) {
-                        self.error_response(context, ErrorResponse::omni_in_direct_to_shard())
-                            .await?;
-                        return Ok(false);
-                    }
-
-                    if Self::is_shard_switch(command, &self.backend) {
-                        self.error_response(context, ErrorResponse::direct_shard_mismatch())
-                            .await?;
-                        return Ok(false);
-                    }
-
-                    // Omnisharded writes pause while the cluster's topology
-                    // changes underneath them (ADD SHARD cutover): the write
-                    // must reach every shard, including the one being
-                    // swapped in. Parks here, before any server is checked
-                    // out. In-transaction writes are exempt: they already
-                    // hold server connections, and parking them would
-                    // deadlock against the drain; the cutover timeout
-                    // covers them.
-                    let waiter = (!context.in_transaction() && {
-                        let route = self.router.command().route();
-                        route.is_omnisharded() && route.is_write()
-                    })
-                    .then(|| crate::backend::fleet::barrier::waiter(cluster.name()))
-                    .flatten();
-                    if let Some(waiter) = waiter {
-                        let state = self.get_state();
-                        self.set_state(State::Waiting);
-                        waiter.await;
-                        self.set_state(state);
-                    }
+                    return Ok(false);
                 }
-            }
-            Err(RouterError::Parser(ParserError::OmniWriteWithDirective)) => {
-                self.error_response(context, ErrorResponse::omni_write_with_directive())
-                    .await?;
+                Err(err) => {
+                    self.error_response(context, ErrorResponse::syntax(err.to_string().as_str()))
+                        .await?;
 
-                return Ok(false);
-            }
-            Err(err) => {
-                self.error_response(context, ErrorResponse::syntax(err.to_string().as_str()))
-                    .await?;
-
-                return Ok(false);
+                    return Ok(false);
+                }
             }
         }
 

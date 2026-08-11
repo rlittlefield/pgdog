@@ -23,10 +23,22 @@ pub(super) fn get_matched_value<'a>(caps: &'a regex::Captures<'a>) -> Option<&'a
         .map(|m| m.as_str())
 }
 
+/// Directives extracted from one comment.
+#[derive(Default)]
+pub(super) struct CommentDirectives {
+    pub(super) shard: Option<ShardOrLookup>,
+    pub(super) role: Option<Role>,
+    /// The raw `pgdog_sharding_key` value. Only recorded while a keyed
+    /// write barrier is armed (MOVE KEYS): the query engine parks
+    /// writes whose keys are paused. The gate keeps steady state
+    /// allocation-free.
+    pub(super) sharding_key: Option<String>,
+}
+
 pub(super) fn shard_role_from_comment(
     comment: &str,
     schema: &ShardingSchema,
-) -> Result<(Option<ShardOrLookup>, Option<Role>), Error> {
+) -> Result<CommentDirectives, Error> {
     let mut role = None;
 
     if let Some(cap) = ROLE.captures(comment)
@@ -41,16 +53,26 @@ pub(super) fn shard_role_from_comment(
     if let Some(cap) = SHARDING_KEY.captures(comment)
         && let Some(sharding_key) = get_matched_value(&cap)
     {
+        let raw_key =
+            crate::backend::fleet::barrier::any_keys_armed().then(|| sharding_key.to_owned());
         if let Some(schema) = schema.schemas.get(Some(sharding_key.into())) {
-            return Ok((Some(ShardOrLookup::Shard(schema.shard().into())), role));
+            return Ok(CommentDirectives {
+                shard: Some(ShardOrLookup::Shard(schema.shard().into())),
+                role,
+                sharding_key: raw_key,
+            });
         }
-        return Ok((Some(shard_for_bare_key(sharding_key, schema, None)?), role));
+        return Ok(CommentDirectives {
+            shard: Some(shard_for_bare_key(sharding_key, schema, None)?),
+            role,
+            sharding_key: raw_key,
+        });
     }
     if let Some(cap) = SHARD.captures(comment)
         && let Some(shard) = cap.get(1)
     {
-        return Ok((
-            Some(ShardOrLookup::Shard(
+        return Ok(CommentDirectives {
+            shard: Some(ShardOrLookup::Shard(
                 shard
                     .as_str()
                     .parse::<usize>()
@@ -59,8 +81,13 @@ pub(super) fn shard_role_from_comment(
                     .unwrap_or(Shard::All),
             )),
             role,
-        ));
+            sharding_key: None,
+        });
     }
 
-    Ok((None, role))
+    Ok(CommentDirectives {
+        shard: None,
+        role,
+        sharding_key: None,
+    })
 }
