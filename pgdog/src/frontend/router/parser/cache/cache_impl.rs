@@ -121,6 +121,7 @@ impl Cache {
                 guard.stats.hits += 1;
                 ast.comment_role = query_and_comment.role;
                 ast.comment_shard = query_and_comment.shard.clone();
+                ast.comment_sharding_key = query_and_comment.sharding_key.clone();
 
                 return Ok(ast);
             }
@@ -137,6 +138,7 @@ impl Cache {
         )?;
         entry.comment_role = query_and_comment.role;
         entry.comment_shard = query_and_comment.shard.clone();
+        entry.comment_sharding_key = query_and_comment.sharding_key.clone();
         let parse_time = entry.stats.lock().parse_time;
 
         let mut guard = self.inner.lock();
@@ -178,6 +180,7 @@ impl Cache {
         entry.cached = false;
         entry.comment_role = query_and_comment.role;
         entry.comment_shard = query_and_comment.shard.clone();
+        entry.comment_sharding_key = query_and_comment.sharding_key.clone();
 
         let parse_time = entry.stats.lock().parse_time;
 

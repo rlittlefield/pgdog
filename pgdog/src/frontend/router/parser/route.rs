@@ -133,6 +133,11 @@ pub struct Route {
     /// The query engine resolves them and routes the query again;
     /// the query doesn't execute while any are unresolved.
     pending_lookups: Vec<PendingLookup>,
+    /// Sharding key values that routed this query, in text form.
+    /// Recorded only while a keyed write barrier is armed (MOVE KEYS),
+    /// so the query engine can park writes for the moving keys; empty
+    /// in steady state.
+    sharding_keys: Vec<String>,
 }
 
 impl Display for Route {
@@ -202,6 +207,16 @@ impl Route {
 
     pub(crate) fn set_pending_lookups(&mut self, pending_lookups: Vec<PendingLookup>) {
         self.pending_lookups = pending_lookups;
+    }
+
+    /// Sharding key values that routed this query. Only recorded while
+    /// a keyed write barrier is armed; empty in steady state.
+    pub fn sharding_keys(&self) -> &[String] {
+        &self.sharding_keys
+    }
+
+    pub(crate) fn set_sharding_keys(&mut self, sharding_keys: Vec<String>) {
+        self.sharding_keys = sharding_keys;
     }
 
     /// Get shard if any.
