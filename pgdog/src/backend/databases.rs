@@ -113,6 +113,7 @@ pub fn init() -> Result<(), Error> {
 
     // Converge provisioning shards and keep their agents running.
     crate::backend::provisioning::on_config_change();
+    crate::backend::key_move::on_config_change();
 
     Ok(())
 }
@@ -161,6 +162,7 @@ pub fn reload() -> Result<(), Error> {
 
     // Converge provisioning shards and keep their agents running.
     crate::backend::provisioning::on_config_change();
+    crate::backend::key_move::on_config_change();
 
     Ok(())
 }
@@ -302,6 +304,68 @@ pub(crate) fn invalidate_lookup_keys(database: &str, keys: &[String]) {
     }
 }
 
+/// Build a launched, non-serving one-shard `Cluster` on shard 0 of a
+/// serving database, for use as a fleet coordination medium. The
+/// caller owns it and must shut it down when done: handing a follower
+/// the serving cluster would kill live pools on its shutdown. Uses the
+/// database's `schema_admin` user's credentials.
+// Consumed by the MOVE KEYS followers.
+#[allow(dead_code)]
+pub(crate) fn medium_cluster(database: &str) -> Result<Cluster, Error> {
+    let config = config();
+    let general = &config.config.general;
+
+    let user = config
+        .users
+        .users
+        .iter()
+        .find(|user| user.database == database && user.schema_admin)
+        .ok_or(Error::NoSchemaAdmin(database.to_string()))?;
+
+    let (number, entry) = config
+        .config
+        .databases
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| {
+            !entry.provisioning
+                && entry.name == database
+                && entry.shard == 0
+                && entry.role == Role::Primary
+        })
+        .ok_or_else(|| Error::NoShardZeroPrimary(database.to_string()))?;
+
+    let primary = PoolConfig {
+        address: Address::new(entry, user, number),
+        config: Config::new(general, entry, user, true),
+    };
+    let shard_configs = vec![ClusterShardConfig {
+        primary: Some(primary),
+        replicas: vec![],
+    }];
+
+    let query_parser = QueryParser {
+        database: database.to_string(),
+        level: general.query_parser,
+        engine: general.query_parser_engine,
+    };
+
+    let cluster_config = ClusterConfig::new(
+        &config.config,
+        user,
+        &shard_configs,
+        ShardedTables::default(),
+        ShardedSchemas::default(),
+        query_parser,
+        SchemaCache::default(),
+    );
+
+    let cluster = Cluster::new(cluster_config);
+    cluster.launch();
+
+    Ok(cluster)
+}
+
 /// Build a launched, non-serving one-shard `Cluster` for a shard being
 /// provisioned by `ADD SHARD`, from its `provisioning = true` entry.
 /// Several future shards can be declared at once; `shard` names the
@@ -406,6 +470,7 @@ pub(crate) async fn activate_provisioning_shard(database: &str, shard: usize) ->
         // The next declared shard (if any) gets its agent, and its
         // convergence check runs, without waiting for a reload.
         crate::backend::provisioning::on_config_change();
+        crate::backend::key_move::on_config_change();
     }
 
     info!(

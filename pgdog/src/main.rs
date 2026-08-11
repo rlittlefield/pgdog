@@ -125,6 +125,7 @@ async fn pgdog(command: Option<Commands>) -> Result<(), Box<dyn std::error::Erro
     // A crashed instance whose config still carries a provisioning
     // flag re-joins the new topology before serving traffic.
     pgdog::backend::provisioning::converge_at_startup().await;
+    pgdog::backend::key_move::converge_at_startup().await;
 
     let general = &config::config().config.general;
 
