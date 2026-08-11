@@ -30,6 +30,12 @@ impl Copy {
         Self { stmt }
     }
 
+    /// Copy out only the rows matching a WHERE predicate (MOVE KEYS).
+    pub fn with_predicate(mut self, predicate: impl Into<String>) -> Self {
+        self.stmt = self.stmt.with_predicate(predicate);
+        self
+    }
+
     pub async fn start(&self, server: &mut Server) -> Result<(), Error> {
         if !server.in_transaction() {
             return Err(Error::TransactionNotStarted);
