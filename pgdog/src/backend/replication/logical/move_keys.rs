@@ -5,7 +5,7 @@
 //! UUIDs lowercased), the same form the WAL filter derives from
 //! replicated tuples, so membership checks can't miss on formatting.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use pgdog_config::{DataType, LookupResult};
 
@@ -227,11 +227,14 @@ pub(crate) async fn enumerate_tables(
         }
 
         // Column-only rule: every regular table bearing the column,
-        // matching how the router shards them.
+        // matching how the router shards them. The column's type must
+        // agree with the configured key type: a table where it doesn't
+        // (a coincidental column name) can't be judged by the WAL
+        // filter and is refused rather than silently corrupted.
         let params = [crate::net::bind::Parameter::new(rule.column.as_bytes())];
         let rows: Vec<crate::net::messages::DataRow> = server
             .fetch_all_params(
-                "SELECT n.nspname, c.relname
+                "SELECT n.nspname, c.relname, a.atttypid::regtype::text
                  FROM pg_attribute a
                  JOIN pg_class c ON c.oid = a.attrelid
                  JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -245,8 +248,23 @@ pub(crate) async fn enumerate_tables(
         for row in rows {
             let schema: String = row.get(0, Format::Text).unwrap_or_default();
             let name: String = row.get(1, Format::Text).unwrap_or_default();
+            let column_type: String = row.get(2, Format::Text).unwrap_or_default();
             if omnisharded.contains(&name) {
                 continue;
+            }
+            let matches = match rule.data_type {
+                DataType::Bigint => column_type == "bigint" || column_type == "integer",
+                DataType::Varchar => column_type == "character varying" || column_type == "text",
+                DataType::Uuid => column_type == "uuid",
+                _ => false,
+            };
+            if !matches {
+                return Err(Error::KeyMoveColumnType {
+                    table: format!("\"{}\".\"{}\"", schema, name),
+                    column: rule.column.clone(),
+                    expected: rule.data_type,
+                    actual: column_type,
+                });
             }
             if seen.insert((schema.clone(), name.clone())) {
                 tables.push(MoveTable {
@@ -321,6 +339,111 @@ pub(crate) async fn replica_identity_covers_key(
     }
 
     Ok(())
+}
+
+/// Foreign keys between regular tables, from one shard's primary:
+/// (child schema, child table, parent schema, parent table).
+pub(crate) async fn table_references(
+    server: &mut Guard,
+) -> Result<Vec<(String, String, String, String)>, Error> {
+    let rows: Vec<crate::net::messages::DataRow> = server
+        .fetch_all(
+            "SELECT cn.nspname, cc.relname, fn.nspname, fc.relname
+             FROM pg_constraint con
+             JOIN pg_class cc ON cc.oid = con.conrelid
+             JOIN pg_namespace cn ON cn.oid = cc.relnamespace
+             JOIN pg_class fc ON fc.oid = con.confrelid
+             JOIN pg_namespace fn ON fn.oid = fc.relnamespace
+             WHERE con.contype = 'f'",
+        )
+        .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get(0, Format::Text).unwrap_or_default(),
+                row.get(1, Format::Text).unwrap_or_default(),
+                row.get(2, Format::Text).unwrap_or_default(),
+                row.get(3, Format::Text).unwrap_or_default(),
+            )
+        })
+        .collect())
+}
+
+/// Order items by the foreign keys between them: parents before the
+/// tables referencing them, or the reverse. Copies into a live schema
+/// need parents first (a child row's parent must exist); deletes need
+/// children first. References to tables outside the set are ignored.
+/// A cycle leaves the stragglers in their original order.
+pub(crate) fn dependency_order<T>(
+    items: Vec<T>,
+    identity: impl Fn(&T) -> (String, String),
+    references: &[(String, String, String, String)],
+    parents_first: bool,
+) -> Vec<T> {
+    let index: HashMap<(String, String), usize> = items
+        .iter()
+        .enumerate()
+        .map(|(position, item)| (identity(item), position))
+        .collect();
+
+    // Edges point at what must come first: parents (parents_first) or
+    // children (deletes).
+    let mut blocks: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut blocked_by: HashMap<usize, usize> = HashMap::new();
+    for (child_schema, child_name, parent_schema, parent_name) in references {
+        let (Some(&child), Some(&parent)) = (
+            index.get(&(child_schema.clone(), child_name.clone())),
+            index.get(&(parent_schema.clone(), parent_name.clone())),
+        ) else {
+            continue;
+        };
+        if child == parent {
+            continue;
+        }
+        let (first, second) = if parents_first {
+            (parent, child)
+        } else {
+            (child, parent)
+        };
+        blocks.entry(first).or_default().push(second);
+        *blocked_by.entry(second).or_insert(0) += 1;
+    }
+
+    // Kahn's algorithm, position-ordered for determinism.
+    let mut queue: std::collections::VecDeque<usize> = (0..items.len())
+        .filter(|position| !blocked_by.contains_key(position))
+        .collect();
+    let mut order = vec![];
+    while let Some(position) = queue.pop_front() {
+        order.push(position);
+        if let Some(unblocks) = blocks.get(&position) {
+            let mut next = vec![];
+            for &blocked in unblocks {
+                if let Some(count) = blocked_by.get_mut(&blocked) {
+                    *count -= 1;
+                    if *count == 0 {
+                        blocked_by.remove(&blocked);
+                        next.push(blocked);
+                    }
+                }
+            }
+            next.sort_unstable();
+            queue.extend(next);
+        }
+    }
+
+    // A cycle leaves stragglers: append them in original order.
+    let mut stragglers: Vec<usize> = blocked_by.into_keys().collect();
+    stragglers.sort_unstable();
+    order.extend(stragglers);
+
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .filter_map(|position| slots[position].take())
+        .collect()
 }
 
 /// The target shard must hold no rows for the moving keys: leftovers
