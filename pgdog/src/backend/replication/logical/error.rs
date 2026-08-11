@@ -115,6 +115,37 @@ pub enum Error {
     #[error("a topology change for database \"{0}\" is already running")]
     TopologyChangeInProgress(String),
 
+    #[error(
+        "sharded {0} places rows by hashing or a static mapping; \
+         moving a single key requires lookup_result = \"shard\""
+    )]
+    PlacementNotByLookup(String),
+
+    #[error("no sharded tables to move keys in")]
+    KeyMoveNoTables,
+
+    #[error(
+        "sharded table {table} uses data type {actual:?}, but the other tables use {expected:?}; \
+         a key move requires one sharding key type"
+    )]
+    KeyMoveDataTypeMismatch {
+        table: String,
+        expected: pgdog_config::DataType,
+        actual: pgdog_config::DataType,
+    },
+
+    #[error("\"{value}\" is not a valid {data_type:?} sharding key")]
+    KeyMoveBadKey {
+        data_type: pgdog_config::DataType,
+        value: String,
+    },
+
+    #[error(
+        "replicated {op} on \"{table}\" doesn't carry the sharding key; \
+         its replica identity must cover the sharding column"
+    )]
+    KeyMoveMissingKey { table: String, op: &'static str },
+
     #[error("net: {0}")]
     Net(#[from] crate::net::Error),
 
