@@ -23,6 +23,7 @@ pub struct ShardedTable {
     pub mapping: Option<Mapping>,
     pub lookup_query: Option<String>,
     pub lookup_result: LookupResult,
+    pub move_query: Option<String>,
 }
 
 #[derive(Debug)]
