@@ -18,7 +18,8 @@ use crate::net::replication::StatusUpdate;
 use crate::util::escape_identifier;
 
 use super::super::{
-    Error, TableValidationError, TableValidationErrorKind, subscriber::CopySubscriber,
+    Error, TableValidationError, TableValidationErrorKind, move_keys::KeyMoveScope,
+    subscriber::CopySubscriber,
 };
 use super::non_identity_columns_presence::NonIdentityColumnsPresence;
 use super::{Copy, PublicationTable, PublicationTableColumn, ReplicaIdentity, ReplicationSlot};
@@ -447,6 +448,7 @@ impl Table {
         dest: &Cluster,
         cancel: &CancellationToken,
         tracker: &TableCopy,
+        key_move: Option<&KeyMoveScope>,
     ) -> Result<Lsn, Error> {
         info!(
             "data sync for \"{}\".\"{}\" started [{}]",
@@ -456,13 +458,29 @@ impl Table {
         // Sync data using COPY.
         // Publisher uses COPY [...] TO STDOUT.
         // Subscriber uses COPY [...] FROM STDIN.
-        let copy = Copy::new(self, config().config.general.resharding_copy_format);
+        let mut copy = Copy::new(self, config().config.general.resharding_copy_format);
+
+        // A key move copies only the moving keys' rows, straight to
+        // the target shard: routing them per row would send them back
+        // to the source (the placement flips at cutover, after the copy).
+        if let Some(scope) = key_move {
+            let column = scope
+                .tables()
+                .iter()
+                .find(|table| table.schema == self.table.schema && table.name == self.table.name)
+                .map(|table| table.sharding_column.as_str())
+                .ok_or(Error::KeyMoveNoTables)?;
+            copy = copy.with_predicate(scope.predicate_sql(column));
+        }
 
         tracker.update_sql(&copy.statement().copy_out());
 
         // Create new standalone connection for the copy.
         // let mut server = Server::connect(source, ServerOptions::new_replication()).await?;
         let mut copy_sub = CopySubscriber::new(copy.statement(), source_cluster, dest)?;
+        if let Some(scope) = key_move {
+            copy_sub.set_fixed_shard(scope.target());
+        }
         copy_sub.connect().await?;
 
         // Create sync slot.

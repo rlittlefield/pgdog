@@ -12,7 +12,7 @@ use tokio::try_join;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use super::super::{Error, ensure_validation, publisher::Table};
+use super::super::{Error, ensure_validation, move_keys::KeyMoveScope, publisher::Table};
 use super::{HybridNullTable, ReplicationSlot};
 
 use crate::backend::replication::logical::subscriber::omni_ownership::OmniOwnership;
@@ -62,6 +62,9 @@ pub struct Publisher {
     /// Sharded tables whose NULL-key rows replicate to the destination
     /// (`broadcast_null`); empty outside ADD SHARD.
     hybrid_tables: Vec<HybridNullTable>,
+    /// Copy and stream only rows for these sharding keys, straight to
+    /// the target shard (MOVE KEYS).
+    key_move: Option<Arc<KeyMoveScope>>,
 }
 
 impl Publisher {
@@ -79,6 +82,7 @@ impl Publisher {
             last_transaction: Arc::new(Mutex::new(None)),
             slot_name,
             hybrid_tables: vec![],
+            key_move: None,
         }
     }
 
@@ -87,6 +91,14 @@ impl Publisher {
     pub fn with_hybrid_tables(mut self, hybrid_tables: Vec<HybridNullTable>) -> Self {
         self.hybrid_tables = hybrid_tables;
         self
+    }
+
+    /// Copy and stream only rows for these sharding keys, straight to
+    /// the target shard (MOVE KEYS).
+    // Consumed by the MOVE KEYS orchestrator mode.
+    #[allow(dead_code)]
+    pub fn set_key_move(&mut self, scope: Arc<KeyMoveScope>) {
+        self.key_move = Some(scope);
     }
 
     pub fn replication_slot(&self) -> &str {
@@ -262,6 +274,9 @@ impl Publisher {
             // (dest_shard % n_sources == source_shard), preventing cross-subscriber deadlocks.
             let mut stream =
                 StreamSubscriber::new(dest, tables, OmniOwnership::new(number, n_sources));
+            if let Some(scope) = &self.key_move {
+                stream.set_key_move(scope.clone());
+            }
 
             // Take ownership of the slot for replication.
             let mut slot = self
@@ -485,8 +500,9 @@ impl Publisher {
             let source = source.clone();
             let dest = dest.clone();
             let cancel = cancel.clone();
+            let key_move = self.key_move.clone();
             handles.push(tasks::spawn("parallel sync manager", async move {
-                let manager = ParallelSyncManager::new(tables, replicas, source, dest)?;
+                let manager = ParallelSyncManager::new(tables, replicas, source, dest, key_move)?;
                 let tables = manager.run(cancel).await?;
 
                 Ok::<(usize, Vec<Table>), Error>((number, tables))
