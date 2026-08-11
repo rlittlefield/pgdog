@@ -410,6 +410,13 @@ impl LookupCache {
         self.cache.insert(CacheKey { table, value }, translated);
     }
 
+    /// Drop the cached translation for a sharding key value, if any.
+    /// The next statement using the value re-runs the lookup query and
+    /// reads the current placement.
+    pub fn invalidate_for_table(&self, table: &ShardedTable, value: &str) {
+        self.cache.invalidate(&(table, value) as &dyn KeyView);
+    }
+
     /// Lookup metrics recorded by this cache.
     pub fn stats(&self) -> &Arc<LookupStats> {
         &self.stats
