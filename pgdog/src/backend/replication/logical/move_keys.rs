@@ -10,7 +10,9 @@ use std::collections::HashSet;
 use pgdog_config::{DataType, LookupResult};
 
 use crate::backend::Cluster;
+use crate::backend::pool::{Guard, Request};
 use crate::frontend::router::sharding::Value as ShardingValue;
+use crate::net::messages::Format;
 use crate::util::quote_literal;
 
 use super::error::Error;
@@ -142,16 +144,214 @@ fn canonical_key(value: &str, data_type: DataType) -> Result<String, Error> {
 /// Every sharded table must place rows via `lookup_result = "shard"`:
 /// that's the only placement a single key can flip. Stricter than
 /// `placement_stable` (ADD SHARD), which also allows static mappings.
+/// Each must also carry the `move_query` that performs the flip.
 pub fn placement_by_lookup(cluster: &Cluster) -> Result<(), Error> {
     for table in cluster.sharded_tables() {
-        if table.lookup_result != LookupResult::Shard {
-            return Err(Error::PlacementNotByLookup(format!(
+        let name = || {
+            format!(
                 "table \"{}\", column \"{}\"",
                 table.name.as_deref().unwrap_or("*"),
                 table.column,
-            )));
+            )
+        };
+        if table.lookup_result != LookupResult::Shard {
+            return Err(Error::PlacementNotByLookup(name()));
+        }
+        if table.move_query.is_none() {
+            return Err(Error::KeyMoveNoMoveQuery(name()));
         }
     }
+    Ok(())
+}
+
+/// Advisory lock key taken on shard 0 of the database (ASCII
+/// "pgdog_mv"): arbitrates which pgdog instance runs `MOVE KEYS` when
+/// several share the same config.
+pub(crate) const MOVE_KEYS_LOCK: i64 = 0x7067646f675f6d76;
+
+/// Take the cross-instance key-move lock on shard 0 of `cluster`.
+/// Session-scoped: the caller must keep the returned connection
+/// checked out for as long as the task runs; a crashed holder releases
+/// it with its connection.
+pub(crate) async fn move_lock(cluster: &Cluster) -> Result<Guard, Error> {
+    let mut server = cluster
+        .shards()
+        .first()
+        .ok_or(crate::backend::pool::Error::NoShard(0))?
+        .primary(&Request::default())
+        .await?;
+
+    let locked: Vec<String> = server
+        .fetch_all(format!("SELECT pg_try_advisory_lock({})", MOVE_KEYS_LOCK).as_str())
+        .await?;
+
+    if locked.first().map(|l| l == "t").unwrap_or(false) {
+        Ok(server)
+    } else {
+        Err(Error::KeyMoveLocked)
+    }
+}
+
+/// Tables bearing a sharding column, resolved on the source shard's
+/// primary: named `[[sharded_tables]]` entries directly, column-only
+/// entries by asking the catalog which tables carry the column. Tables
+/// declared omnisharded are excluded: their writes broadcast and their
+/// rows don't move.
+pub(crate) async fn enumerate_tables(
+    cluster: &Cluster,
+    source_shard: usize,
+    omnisharded: &[String],
+) -> Result<Vec<MoveTable>, Error> {
+    let mut tables: Vec<MoveTable> = vec![];
+    let mut seen = HashSet::new();
+
+    let mut server = cluster
+        .shards()
+        .get(source_shard)
+        .ok_or(crate::backend::pool::Error::NoShard(source_shard))?
+        .primary(&Request::default())
+        .await?;
+
+    for rule in cluster.sharded_tables() {
+        if let Some(name) = &rule.name {
+            let schema = rule.schema.clone().unwrap_or_else(|| "public".into());
+            if seen.insert((schema.clone(), name.clone())) {
+                tables.push(MoveTable {
+                    schema,
+                    name: name.clone(),
+                    sharding_column: rule.column.clone(),
+                    data_type: rule.data_type,
+                });
+            }
+            continue;
+        }
+
+        // Column-only rule: every regular table bearing the column,
+        // matching how the router shards them.
+        let params = [crate::net::bind::Parameter::new(rule.column.as_bytes())];
+        let rows: Vec<crate::net::messages::DataRow> = server
+            .fetch_all_params(
+                "SELECT n.nspname, c.relname
+                 FROM pg_attribute a
+                 JOIN pg_class c ON c.oid = a.attrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE a.attname = $1 AND NOT a.attisdropped AND a.attnum > 0
+                   AND c.relkind = 'r'
+                   AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pgdog')
+                 ORDER BY 1, 2",
+                &params,
+            )
+            .await?;
+        for row in rows {
+            let schema: String = row.get(0, Format::Text).unwrap_or_default();
+            let name: String = row.get(1, Format::Text).unwrap_or_default();
+            if omnisharded.contains(&name) {
+                continue;
+            }
+            if seen.insert((schema.clone(), name.clone())) {
+                tables.push(MoveTable {
+                    schema,
+                    name,
+                    sharding_column: rule.column.clone(),
+                    data_type: rule.data_type,
+                });
+            }
+        }
+    }
+
+    Ok(tables)
+}
+
+/// Every moving table's replica identity must cover its sharding
+/// column: DELETE and identity-only UPDATE events carry only identity
+/// columns, and the WAL filter can't judge a change whose key it can't
+/// see. Checked on the source shard's primary; refused with a hint.
+pub(crate) async fn replica_identity_covers_key(
+    cluster: &Cluster,
+    source_shard: usize,
+    tables: &[MoveTable],
+) -> Result<(), Error> {
+    let mut server = cluster
+        .shards()
+        .get(source_shard)
+        .ok_or(crate::backend::pool::Error::NoShard(source_shard))?
+        .primary(&Request::default())
+        .await?;
+
+    for table in tables {
+        let params = [
+            crate::net::bind::Parameter::new(table.schema.as_bytes()),
+            crate::net::bind::Parameter::new(table.name.as_bytes()),
+            crate::net::bind::Parameter::new(table.sharding_column.as_bytes()),
+        ];
+        let rows: Vec<crate::net::messages::DataRow> = server
+            .fetch_all_params(
+                "SELECT CASE c.relreplident
+                    WHEN 'f' THEN true
+                    WHEN 'd' THEN EXISTS (
+                        SELECT 1 FROM pg_index i
+                        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                        WHERE i.indrelid = c.oid AND i.indisprimary AND a.attname = $3
+                    )
+                    WHEN 'i' THEN EXISTS (
+                        SELECT 1 FROM pg_index i
+                        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                        WHERE i.indrelid = c.oid AND i.indisreplident AND a.attname = $3
+                    )
+                    ELSE false
+                 END
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = $1 AND c.relname = $2",
+                &params,
+            )
+            .await?;
+
+        let covered = rows
+            .first()
+            .and_then(|row| row.get::<String>(0, Format::Text))
+            .map(|value| value == "t" || value == "true")
+            .unwrap_or(false);
+        if !covered {
+            return Err(Error::KeyMoveIdentityGap {
+                table: format!("\"{}\".\"{}\"", table.schema, table.name),
+                column: table.sharding_column.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// The target shard must hold no rows for the moving keys: leftovers
+/// from a crashed prior attempt would collide with the copy. Refused
+/// with the cleanup DELETE in the error.
+pub(crate) async fn target_is_clean(cluster: &Cluster, scope: &KeyMoveScope) -> Result<(), Error> {
+    let mut server = cluster
+        .shards()
+        .get(scope.target())
+        .ok_or(crate::backend::pool::Error::NoShard(scope.target()))?
+        .primary(&Request::default())
+        .await?;
+
+    for table in scope.tables() {
+        let predicate = scope.predicate_sql(&table.sharding_column);
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM \"{}\".\"{}\" WHERE {})",
+            table.schema, table.name, predicate
+        );
+        let exists: Vec<String> = server.fetch_all(sql.as_str()).await?;
+        if exists.first().map(|e| e == "t").unwrap_or(false) {
+            return Err(Error::KeyMoveTargetDirty {
+                table: format!("\"{}\".\"{}\"", table.schema, table.name),
+                cleanup: format!(
+                    "DELETE FROM \"{}\".\"{}\" WHERE {}",
+                    table.schema, table.name, predicate
+                ),
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -228,12 +428,13 @@ mod test {
         use crate::backend::{Cluster, ShardedTables};
         use pgdog_config::{ConfigAndUsers, SystemCatalogsBehavior};
 
-        let cluster = |lookup_result| {
+        let cluster = |lookup_result, move_query: Option<&str>| {
             let table = ShardedTable {
                 database: "pgdog".into(),
                 column: "tenant_id".into(),
                 lookup_query: Some("SELECT shard_id FROM tenants WHERE id = $1".into()),
                 lookup_result,
+                move_query: move_query.map(|q| q.to_string()),
                 ..Default::default()
             };
             let mut cluster = Cluster::new_test(&ConfigAndUsers::default());
@@ -246,7 +447,11 @@ mod test {
             cluster
         };
 
-        placement_by_lookup(&cluster(LookupResult::Shard)).unwrap();
-        assert!(placement_by_lookup(&cluster(LookupResult::Value)).is_err());
+        let move_query = "UPDATE tenants SET shard_id = $2 WHERE id = $1";
+        placement_by_lookup(&cluster(LookupResult::Shard, Some(move_query))).unwrap();
+        // Hashed placement can't flip a single key.
+        assert!(placement_by_lookup(&cluster(LookupResult::Value, Some(move_query))).is_err());
+        // Without a move_query there's nothing to flip it with.
+        assert!(placement_by_lookup(&cluster(LookupResult::Shard, None)).is_err());
     }
 }

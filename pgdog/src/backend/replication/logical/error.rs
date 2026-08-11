@@ -162,6 +162,39 @@ pub enum Error {
     )]
     KeyMoveMissingKey { table: String, op: &'static str },
 
+    #[error("sharded {0} has no \"move_query\" to flip a key's placement with")]
+    KeyMoveNoMoveQuery(String),
+
+    #[error("another pgdog instance is already moving keys in this database")]
+    KeyMoveLocked,
+
+    #[error(
+        "the replica identity of {table} doesn't cover sharding column \"{column}\"; \
+         run ALTER TABLE {table} REPLICA IDENTITY FULL, or use an index that covers it"
+    )]
+    KeyMoveIdentityGap { table: String, column: String },
+
+    #[error(
+        "the target shard holds rows for the moving keys in {table}, \
+         likely from a crashed prior attempt; clean it first: {cleanup}"
+    )]
+    KeyMoveTargetDirty { table: String, cleanup: String },
+
+    #[error(
+        "key \"{key}\" resolves to shard {got}, but the other keys resolve to shard {expected}; move them separately"
+    )]
+    KeysSpanShards {
+        key: String,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("key \"{key}\" already lives on shard {shard}")]
+    KeyAlreadyOnTarget { key: String, shard: usize },
+
+    #[error("shard {target} doesn't exist: the database has {shards} shard(s)")]
+    KeyMoveTargetOutOfRange { target: usize, shards: usize },
+
     #[error("net: {0}")]
     Net(#[from] crate::net::Error),
 
