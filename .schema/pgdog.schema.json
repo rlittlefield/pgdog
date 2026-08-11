@@ -2218,6 +2218,14 @@
             "$ref": "#/$defs/ShardedMappingConfig"
           }
         },
+        "move_query": {
+          "description": "UPDATE that reassigns a sharding key to a different shard, e.g.\n`UPDATE tenants SET shard_id = $2 WHERE id = $1`. `$1` is the sharding\nkey value and `$2` is the new shard number. Used by `MOVE KEYS` to flip\na key's placement during the cutover: the query runs on every shard,\nso the table it writes must be omnisharded (the same table\n`lookup_query` reads). A moved key always has a mapping row already,\nso an UPDATE is sufficient.\n\n**Note:** Requires `lookup_query` with `lookup_result = \"shard\"`:\nmoving a single key is only possible when the application owns\nplacement.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
         "name": {
           "description": "The name of the PostgreSQL table. Only columns explicitly referencing that table will be sharded. If not specified, all tables with the specified column are considered sharded.\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#name>",
           "type": [

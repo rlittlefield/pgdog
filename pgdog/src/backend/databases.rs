@@ -639,6 +639,7 @@ fn resolve_sharded_table(
         mapping: mapping.flatten(),
         lookup_query: config.lookup_query.clone(),
         lookup_result: config.lookup_result,
+        move_query: config.move_query.clone(),
     }
 }
 
