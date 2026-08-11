@@ -217,6 +217,21 @@ async fn pgdog(command: Option<Commands>) -> Result<(), Box<dyn std::error::Erro
                 }
             }
 
+            if let Commands::MoveKeys { .. } = command {
+                info!("🔄 entering move keys mode");
+                let result = cli::move_keys(command.clone()).await;
+
+                // Wait for the 2PC monitor to drain any in-flight cleanup
+                // before the process exits, even on error.
+                Manager::get().shutdown().await;
+                databases::shutdown();
+
+                if let Err(err) = result {
+                    error!("{}", err);
+                    return Err(err);
+                }
+            }
+
             if let Commands::SchemaSync { .. } = command {
                 info!("🔄 entering schema sync mode");
                 let result = cli::schema_sync(command.clone()).await;
