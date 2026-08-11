@@ -3,8 +3,6 @@
 //! flipping. Children delete before parents, so foreign keys between
 //! moving tables don't block the sweep.
 
-use std::collections::{HashMap, HashSet};
-
 use tracing::{info, warn};
 
 use super::MoveKeysTask;
@@ -13,8 +11,9 @@ use crate::backend::Cluster;
 use crate::backend::databases::invalidate_lookup_keys;
 use crate::backend::pool::Request;
 use crate::backend::replication::logical::Error;
-use crate::backend::replication::logical::move_keys::{KeyMoveScope, MoveTable};
-use crate::net::messages::{DataRow, Format};
+use crate::backend::replication::logical::move_keys::{
+    KeyMoveScope, MoveTable, dependency_order, table_references,
+};
 use crate::util::safe_sleep;
 use std::time::Duration;
 
@@ -86,7 +85,7 @@ pub(super) async fn scrub_target(preflight: &Preflight) {
 
 /// The manual recovery statements, children first.
 fn recovery_sql(scope: &KeyMoveScope) -> String {
-    let order = delete_order(scope.tables(), &[]);
+    let order = delete_order(scope.tables().to_vec(), &[]);
     order
         .iter()
         .map(|table| {
@@ -138,8 +137,8 @@ async fn delete_rows_once(
     // Foreign keys between moving tables force an order: children
     // before parents. Keys referenced from outside the moving set
     // aren't our rows to delete and fail loudly instead.
-    let references = foreign_keys(&mut server).await?;
-    let order = delete_order(scope.tables(), &references);
+    let references = table_references(&mut server).await?;
+    let order = delete_order(scope.tables().to_vec(), &references);
 
     server.execute("BEGIN").await?;
     let mut deleted = 0u64;
@@ -165,112 +164,17 @@ async fn delete_rows_once(
     Ok(deleted)
 }
 
-/// Foreign keys between regular tables: (child schema, child table,
-/// parent schema, parent table).
-async fn foreign_keys(
-    server: &mut crate::backend::pool::Guard,
-) -> Result<Vec<(String, String, String, String)>, Error> {
-    let rows: Vec<DataRow> = server
-        .fetch_all(
-            "SELECT cn.nspname, cc.relname, fn.nspname, fc.relname
-             FROM pg_constraint con
-             JOIN pg_class cc ON cc.oid = con.conrelid
-             JOIN pg_namespace cn ON cn.oid = cc.relnamespace
-             JOIN pg_class fc ON fc.oid = con.confrelid
-             JOIN pg_namespace fn ON fn.oid = fc.relnamespace
-             WHERE con.contype = 'f'",
-        )
-        .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            (
-                row.get(0, Format::Text).unwrap_or_default(),
-                row.get(1, Format::Text).unwrap_or_default(),
-                row.get(2, Format::Text).unwrap_or_default(),
-                row.get(3, Format::Text).unwrap_or_default(),
-            )
-        })
-        .collect())
-}
-
-/// Order the moving tables children-first: a table deletes before any
-/// table it references. Cycles fall back to declaration order, inside
-/// the caller's transaction, and surface as constraint errors with the
-/// recovery SQL if Postgres can't take it.
-fn delete_order<'a>(
-    tables: &'a [MoveTable],
+/// Children delete before their parents.
+fn delete_order(
+    tables: Vec<MoveTable>,
     references: &[(String, String, String, String)],
-) -> Vec<&'a MoveTable> {
-    let index: HashMap<(&str, &str), usize> = tables
-        .iter()
-        .enumerate()
-        .map(|(position, table)| ((table.schema.as_str(), table.name.as_str()), position))
-        .collect();
-
-    // Edges: child -> parent, both inside the moving set.
-    let mut parents: HashMap<usize, HashSet<usize>> = HashMap::new();
-    let mut children: HashMap<usize, HashSet<usize>> = HashMap::new();
-    for (child_schema, child_name, parent_schema, parent_name) in references {
-        let (Some(&child), Some(&parent)) = (
-            index.get(&(child_schema.as_str(), child_name.as_str())),
-            index.get(&(parent_schema.as_str(), parent_name.as_str())),
-        ) else {
-            continue;
-        };
-        if child == parent {
-            continue;
-        }
-        parents.entry(child).or_default().insert(parent);
-        children.entry(parent).or_default().insert(child);
-    }
-
-    // Kahn's algorithm from the leaves (tables no mover references).
-    let mut remaining: HashMap<usize, usize> = (0..tables.len())
-        .map(|position| {
-            (
-                position,
-                children.get(&position).map(|c| c.len()).unwrap_or(0),
-            )
-        })
-        .collect();
-    let mut ready: Vec<usize> = remaining
-        .iter()
-        .filter(|(_, count)| **count == 0)
-        .map(|(position, _)| *position)
-        .collect();
-    ready.sort_unstable();
-
-    let mut order = vec![];
-    let mut queue = std::collections::VecDeque::from(ready);
-    while let Some(position) = queue.pop_front() {
-        remaining.remove(&position);
-        order.push(position);
-        if let Some(parents) = parents.get(&position) {
-            let mut unblocked = vec![];
-            for &parent in parents {
-                if let Some(count) = remaining.get_mut(&parent) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        unblocked.push(parent);
-                    }
-                }
-            }
-            unblocked.sort_unstable();
-            queue.extend(unblocked);
-        }
-    }
-
-    // A cycle leaves stragglers: append them in declaration order.
-    let mut stragglers: Vec<usize> = remaining.into_keys().collect();
-    stragglers.sort_unstable();
-    order.extend(stragglers);
-
-    order
-        .into_iter()
-        .map(|position| &tables[position])
-        .collect()
+) -> Vec<MoveTable> {
+    dependency_order(
+        tables,
+        |table| (table.schema.clone(), table.name.clone()),
+        references,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -302,18 +206,18 @@ mod test {
         let tables = vec![table("tenants"), table("orders"), table("line_items")];
         let references = vec![edge("orders", "tenants"), edge("line_items", "orders")];
 
-        let order = delete_order(&tables, &references)
+        let order = delete_order(tables.clone(), &references)
             .into_iter()
-            .map(|table| table.name.as_str())
+            .map(|table| table.name)
             .collect::<Vec<_>>();
         assert_eq!(order, vec!["line_items", "orders", "tenants"]);
 
         // Foreign keys to tables outside the moving set don't affect
         // the order.
         let references = vec![edge("orders", "users")];
-        let order = delete_order(&tables, &references)
+        let order = delete_order(tables, &references)
             .into_iter()
-            .map(|table| table.name.as_str())
+            .map(|table| table.name)
             .collect::<Vec<_>>();
         assert_eq!(order, vec!["tenants", "orders", "line_items"]);
     }
@@ -325,7 +229,7 @@ mod test {
         let tables = vec![table("a"), table("b")];
         let references = vec![edge("a", "b"), edge("b", "a")];
 
-        let order = delete_order(&tables, &references);
+        let order = delete_order(tables, &references);
         assert_eq!(order.len(), 2);
     }
 }

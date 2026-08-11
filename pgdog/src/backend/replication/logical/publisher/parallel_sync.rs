@@ -37,25 +37,27 @@ struct ParallelSync {
 impl ParallelSync {
     // Run parallel sync.
     pub fn run(self) -> JoinHandle<Result<Table, Error>> {
-        tasks::spawn("parallel sync", async move {
-            // Record copy in queue before waiting for permit.
-            let tracker = TableCopy::new(&self.table.table.schema, &self.table.table.name);
+        tasks::spawn("parallel sync", self.task())
+    }
 
-            // This won't acquire until we have at least 1 available permit.
-            // Permit will be given back when this task completes.
-            // acquire_owned() consumes a cloned Arc, returning an OwnedSemaphorePermit with
-            // no lifetime tied to `self`, which allows the subsequent `&mut self` borrow.
-            let _permit = Arc::clone(&self.permit)
-                .acquire_owned()
-                .await
-                .map_err(|_| Error::ParallelConnection)?;
+    async fn task(self) -> Result<Table, Error> {
+        // Record copy in queue before waiting for permit.
+        let tracker = TableCopy::new(&self.table.table.schema, &self.table.table.name);
 
-            if self.cancel.is_cancelled() {
-                return Err(Error::DataSyncAborted);
-            }
+        // This won't acquire until we have at least 1 available permit.
+        // Permit will be given back when this task completes.
+        // acquire_owned() consumes a cloned Arc, returning an OwnedSemaphorePermit with
+        // no lifetime tied to `self`, which allows the subsequent `&mut self` borrow.
+        let _permit = Arc::clone(&self.permit)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::ParallelConnection)?;
 
-            self.run_with_retry(&tracker).await
-        })
+        if self.cancel.is_cancelled() {
+            return Err(Error::DataSyncAborted);
+        }
+
+        self.run_with_retry(&tracker).await
     }
 
     /// Retry loop: attempt the table copy up to `max_retries` times.
@@ -267,6 +269,30 @@ impl ParallelSyncManager {
         // cycle() is the idiomatic "rewind": it restarts the iterator from the
         // beginning once exhausted, giving round-robin distribution across replicas.
         let mut replicas_iter = self.replicas.iter().cycle();
+
+        // A key move copies into a live schema whose foreign keys are
+        // already enforced: tables copy one at a time, in the
+        // parents-first order the caller arranged, so a child row's
+        // parent is committed before the child copies.
+        if self.key_move.is_some() {
+            let mut tables = Vec::with_capacity(self.tables.len());
+            for table in self.tables {
+                let replica = replicas_iter
+                    .next()
+                    .expect("replicas is non-empty; checked in new()");
+                let sync = ParallelSync {
+                    table,
+                    addr: replica.addr().clone(),
+                    source: self.source.clone(),
+                    dest: self.dest.clone(),
+                    permit: self.permit.clone(),
+                    cancel: cancel.clone(),
+                    key_move: self.key_move.clone(),
+                };
+                tables.push(sync.task().await?);
+            }
+            return Ok(tables);
+        }
 
         let mut handles = FuturesUnordered::new();
 

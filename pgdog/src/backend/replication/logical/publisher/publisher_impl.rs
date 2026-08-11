@@ -464,11 +464,27 @@ impl Publisher {
         let mut handles = FuturesUnordered::new();
 
         for (number, shard) in source.shards().iter().enumerate() {
-            let tables = self
+            let mut tables = self
                 .tables
                 .get(&number)
                 .ok_or(Error::NoReplicationTables(number))?
                 .clone();
+
+            // A key move copies into a live schema: order the tables
+            // parents-first so the sequential copy satisfies the
+            // foreign keys between them.
+            if self.key_move.is_some() {
+                let mut primary = shard.primary(&Request::default()).await?;
+                let references =
+                    crate::backend::replication::logical::move_keys::table_references(&mut primary)
+                        .await?;
+                tables = crate::backend::replication::logical::move_keys::dependency_order(
+                    tables,
+                    |table| (table.table.schema.clone(), table.table.name.clone()),
+                    &references,
+                    true,
+                );
+            }
 
             info!(
                 "table sync starting for {} tables, shard={}",

@@ -195,6 +195,17 @@ pub enum Error {
     #[error("shard {target} doesn't exist: the database has {shards} shard(s)")]
     KeyMoveTargetOutOfRange { target: usize, shards: usize },
 
+    #[error(
+        "table {table}'s column \"{column}\" is {actual}, but the sharding key type is \
+         {expected:?}; every table bearing the column must use the key's type"
+    )]
+    KeyMoveColumnType {
+        table: String,
+        column: String,
+        expected: pgdog_config::DataType,
+        actual: String,
+    },
+
     #[error("net: {0}")]
     Net(#[from] crate::net::Error),
 
