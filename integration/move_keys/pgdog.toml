@@ -1,0 +1,33 @@
+[general]
+host = "127.0.0.1"
+port = 6499
+
+[admin]
+password = "pgdog"
+
+#
+# Serving cluster: 2 shards. Keys move between them.
+#
+[[databases]]
+name = "pgdog"
+host = "127.0.0.1"
+database_name = "pgdog1"
+shard = 0
+
+[[databases]]
+name = "pgdog"
+host = "127.0.0.1"
+database_name = "pgdog2"
+shard = 1
+
+[[sharded_tables]]
+database = "pgdog"
+column = "org_id"
+data_type = "varchar"
+lookup_query = "SELECT shard_id::text FROM orgs WHERE id = $1"
+lookup_result = "shard"
+move_query = "UPDATE orgs SET shard_id = $2 WHERE id = $1"
+
+[[omnisharded_tables]]
+database = "pgdog"
+tables = ["orgs"]
