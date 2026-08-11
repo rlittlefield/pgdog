@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::backend::fleet::registry;
 use crate::backend::pool::Request;
 use crate::backend::{Cluster, Error};
+use crate::net::bind::Parameter;
 use crate::net::messages::{DataRow, Format};
 
 /// How often a coordinator refreshes a state it holds followers in.
@@ -65,6 +66,11 @@ pub(crate) struct StateRow {
     pub(crate) epoch: i64,
     pub(crate) coordinator: i64,
     pub(crate) age_secs: i64,
+    /// Consumer-defined data riding the state, e.g. which keys a
+    /// coordinated operation covers. Acks carry only the state string.
+    // Consumed by the MOVE KEYS follower.
+    #[allow(dead_code)]
+    pub(crate) payload: Option<String>,
 }
 
 impl StateRow {
@@ -82,6 +88,11 @@ impl From<DataRow> for StateRow {
             epoch: value.get(1, Format::Text).unwrap_or_default(),
             coordinator: value.get(2, Format::Text).unwrap_or_default(),
             age_secs: value.get(3, Format::Text).unwrap_or_default(),
+            // NULL and '' both mean no payload: a NULL column decodes
+            // as empty bytes.
+            payload: value
+                .get::<String>(4, Format::Text)
+                .filter(|payload| !payload.is_empty()),
         }
     }
 }
@@ -113,7 +124,8 @@ pub(crate) async fn ensure_tables(cluster: &Cluster) -> Result<(), Error> {
                  state TEXT NOT NULL,
                  epoch BIGINT NOT NULL,
                  coordinator BIGINT NOT NULL,
-                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 payload TEXT
              );
              CREATE TABLE IF NOT EXISTS pgdog.fleet_acks (
                  topic TEXT NOT NULL,
@@ -122,7 +134,8 @@ pub(crate) async fn ensure_tables(cluster: &Cluster) -> Result<(), Error> {
                  state TEXT NOT NULL,
                  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                  PRIMARY KEY (topic, node_id, epoch)
-             );",
+             );
+             ALTER TABLE pgdog.fleet_state ADD COLUMN IF NOT EXISTS payload TEXT;",
         )
         .await?;
     Ok(())
@@ -139,35 +152,48 @@ pub(crate) async fn drop_tables(cluster: &Cluster) -> Result<(), Error> {
     Ok(())
 }
 
-/// Publish the coordinator's state. NOTIFY rides the same statement,
-/// so it fires with the commit.
+/// Publish the coordinator's state, with an optional consumer-defined
+/// payload bound as a parameter: payloads carry arbitrary values, e.g.
+/// sharding keys, that must not be interpolated into SQL. NOTIFY
+/// follows on the same connection, so it fires once the write is
+/// committed and followers re-read the fresh row.
 pub(crate) async fn write_state(
     cluster: &Cluster,
     topic: Topic,
     state: &str,
     epoch: i64,
     coordinator: i64,
+    payload: Option<&str>,
 ) -> Result<(), Error> {
     let mut server = shard_primary(cluster).await?;
+    let params = [
+        Parameter::new(state.as_bytes()),
+        match payload {
+            Some(payload) => Parameter::new(payload.as_bytes()),
+            None => Parameter::new_null(),
+        },
+    ];
     server
-        .execute(
+        .fetch_all_params::<DataRow>(
             format!(
-                "INSERT INTO pgdog.fleet_state (topic, state, epoch, coordinator)
-                 VALUES ('{}', '{}', {}, {})
+                "INSERT INTO pgdog.fleet_state (topic, state, epoch, coordinator, payload)
+                 VALUES ('{}', $1, {}, {}, $2)
                  ON CONFLICT (topic) DO UPDATE
                  SET state = EXCLUDED.state,
                      epoch = EXCLUDED.epoch,
                      coordinator = EXCLUDED.coordinator,
-                     updated_at = NOW();
-                 NOTIFY \"{}\"",
+                     payload = EXCLUDED.payload,
+                     updated_at = NOW()",
                 topic.as_str(),
-                state,
                 epoch,
                 coordinator,
-                topic.channel()
             )
             .as_str(),
+            &params,
         )
+        .await?;
+    server
+        .execute(format!("NOTIFY \"{}\"", topic.channel()).as_str())
         .await?;
     Ok(())
 }
@@ -187,7 +213,8 @@ pub(crate) async fn read_state(cluster: &Cluster, topic: Topic) -> Result<Option
         .fetch_all(
             format!(
                 "SELECT state, epoch, coordinator,
-                        EXTRACT(EPOCH FROM NOW() - updated_at)::bigint
+                        EXTRACT(EPOCH FROM NOW() - updated_at)::bigint,
+                        COALESCE(payload, '')
                  FROM pgdog.fleet_state WHERE topic = '{}'",
                 topic.as_str()
             )
@@ -269,5 +296,27 @@ mod test {
         const TOPIC: Topic = Topic::new("add_shard");
         assert_eq!(TOPIC.channel(), "__pgdog_fleet_add_shard");
         assert_eq!(TOPIC.as_str(), "add_shard");
+    }
+
+    #[test]
+    fn test_state_row_payload() {
+        use bytes::Bytes;
+
+        let row = |payload: &'static [u8]| {
+            DataRow::from_columns(vec![
+                Bytes::from_static(b"armed"),
+                Bytes::from_static(b"1"),
+                Bytes::from_static(b"2"),
+                Bytes::from_static(b"0"),
+                Bytes::from_static(payload),
+            ])
+        };
+
+        let state = StateRow::from(row(b"{\"keys\":[\"11\"]}"));
+        assert_eq!(state.payload.as_deref(), Some("{\"keys\":[\"11\"]}"));
+
+        // NULL decodes as empty bytes; both mean no payload.
+        let state = StateRow::from(row(b""));
+        assert_eq!(state.payload, None);
     }
 }
