@@ -38,6 +38,7 @@ pub enum ParseResult {
     Ban(Ban),
     Probe(Probe),
     MaintenanceMode(MaintenanceMode),
+    OmniWrites(OmniWrites),
     Healthcheck(Healthcheck),
     Reshard(Reshard),
     SchemaSync(SchemaSync),
@@ -86,6 +87,7 @@ impl ParseResult {
             Ban(ban) => ban.execute().await,
             Probe(probe) => probe.execute().await,
             MaintenanceMode(maintenance_mode) => maintenance_mode.execute().await,
+            OmniWrites(omni_writes) => omni_writes.execute().await,
             Healthcheck(healthcheck) => healthcheck.execute().await,
             Reshard(reshard) => reshard.execute().await,
             SchemaSync(cmd) => cmd.execute().await,
@@ -134,6 +136,7 @@ impl ParseResult {
             Ban(ban) => ban.name(),
             Probe(probe) => probe.name(),
             MaintenanceMode(maintenance_mode) => maintenance_mode.name(),
+            OmniWrites(omni_writes) => omni_writes.name(),
             Healthcheck(healthcheck) => healthcheck.name(),
             Reshard(reshard) => reshard.name(),
             SchemaSync(cmd) => cmd.name(),
@@ -227,6 +230,7 @@ impl Parser {
             "cutover" => ParseResult::Cutover(Cutover::parse(&sql)?),
             "probe" => ParseResult::Probe(Probe::parse(&sql)?),
             "maintenance" => ParseResult::MaintenanceMode(MaintenanceMode::parse(&sql)?),
+            "omni_writes" => ParseResult::OmniWrites(OmniWrites::parse(&sql)?),
             // TODO: This is not ready yet. We have a race and
             // also the changed settings need to be propagated
             // into the pools.

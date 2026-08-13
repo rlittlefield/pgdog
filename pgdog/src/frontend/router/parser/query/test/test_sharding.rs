@@ -375,6 +375,58 @@ fn test_set_sharding_key_goes_through_lookup() {
     );
 }
 
+/// While a keyed write barrier is armed (MOVE KEYS), routes record the
+/// sharding key values that routed the statement, in every form they
+/// arrive in, so the query engine can park writes for paused keys.
+/// Steady state records nothing.
+#[test]
+fn test_route_records_keys_while_barrier_armed() {
+    use crate::backend::fleet::barrier;
+
+    let tables = lookup_rule_tables();
+    warm_lookup_cache(&tables, "org_child", "org_root");
+    let mut test = QueryParserTest::new().with_sharded_tables(tables.clone());
+
+    let update = "UPDATE some_table SET value = 1 WHERE organization_id = 'org_child'";
+
+    // Steady state: no keys recorded.
+    let command = test.execute(vec![Query::new(update).into()]);
+    assert!(command.route().sharding_keys().is_empty());
+
+    // Armed (for any database): a statement-embedded key is recorded.
+    barrier::start_keys("keyed_route_test_db", &["11".to_string()]);
+    let command = test.execute(vec![Query::new(update).into()]);
+    assert_eq!(command.route().sharding_keys(), ["org_child"]);
+
+    // A comment-directive key is recorded. (Keys are recorded on
+    // reads too; only writes consult them at the barrier.)
+    let command = test.execute(vec![
+        Query::new("/* pgdog_sharding_key: 'org_child' */ SELECT * FROM some_table").into(),
+    ]);
+    assert_eq!(command.route().sharding_keys(), ["org_child"]);
+
+    barrier::stop_keys("keyed_route_test_db");
+}
+
+/// `SET pgdog.sharding_key` keys are recorded on the route while a
+/// keyed write barrier is armed.
+#[test]
+fn test_route_records_set_key_while_barrier_armed() {
+    use crate::backend::fleet::barrier;
+
+    let tables = lookup_rule_tables();
+    warm_lookup_cache(&tables, "org_child", "org_root");
+    let mut test = QueryParserTest::new()
+        .with_sharded_tables(tables)
+        .without_sharded_schemas()
+        .with_param("pgdog.sharding_key", "org_child");
+
+    barrier::start_keys("keyed_route_set_test_db", &["11".to_string()]);
+    let command = test.execute(vec![Query::new("SELECT * FROM some_table").into()]);
+    assert_eq!(command.route().sharding_keys(), ["org_child"]);
+    barrier::stop_keys("keyed_route_set_test_db");
+}
+
 /// A write that only touches omnisharded tables must reach every
 /// shard: a shard directive on it is an error, with a cold cache
 /// (the key's lookup doesn't run) and with a warm one.
