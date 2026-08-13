@@ -115,6 +115,81 @@ pub enum Error {
     #[error("a topology change for database \"{0}\" is already running")]
     TopologyChangeInProgress(String),
 
+    #[error(
+        "sharded {0} places rows by hashing or a static mapping; \
+         moving a single key requires lookup_result = \"shard\""
+    )]
+    PlacementNotByLookup(String),
+
+    #[error("no sharded tables to move keys in")]
+    KeyMoveNoTables,
+
+    #[error(
+        "sharded table {table} uses data type {actual:?}, but the other tables use {expected:?}; \
+         a key move requires one sharding key type"
+    )]
+    KeyMoveDataTypeMismatch {
+        table: String,
+        expected: pgdog_config::DataType,
+        actual: pgdog_config::DataType,
+    },
+
+    #[error("\"{value}\" is not a valid {data_type:?} sharding key")]
+    KeyMoveBadKey {
+        data_type: pgdog_config::DataType,
+        value: String,
+    },
+
+    #[error(
+        "replicated {op} on \"{table}\" doesn't carry the sharding key; \
+         its replica identity must cover the sharding column"
+    )]
+    KeyMoveMissingKey { table: String, op: &'static str },
+
+    #[error("sharded {0} has no \"move_query\" to flip a key's placement with")]
+    KeyMoveNoMoveQuery(String),
+
+    #[error("another pgdog instance is already moving keys in this database")]
+    KeyMoveLocked,
+
+    #[error(
+        "the replica identity of {table} doesn't cover sharding column \"{column}\"; \
+         run ALTER TABLE {table} REPLICA IDENTITY FULL, or use an index that covers it"
+    )]
+    KeyMoveIdentityGap { table: String, column: String },
+
+    #[error(
+        "the target shard holds rows for the moving keys in {table}, \
+         likely from a crashed prior attempt; clean it first: {cleanup}"
+    )]
+    KeyMoveTargetDirty { table: String, cleanup: String },
+
+    #[error(
+        "key \"{key}\" resolves to shard {got}, but the other keys resolve to shard {expected}; move them separately"
+    )]
+    KeysSpanShards {
+        key: String,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("key \"{key}\" already lives on shard {shard}")]
+    KeyAlreadyOnTarget { key: String, shard: usize },
+
+    #[error("shard {target} doesn't exist: the database has {shards} shard(s)")]
+    KeyMoveTargetOutOfRange { target: usize, shards: usize },
+
+    #[error(
+        "table {table}'s column \"{column}\" is {actual}, but the sharding key type is \
+         {expected:?}; every table bearing the column must use the key's type"
+    )]
+    KeyMoveColumnType {
+        table: String,
+        column: String,
+        expected: pgdog_config::DataType,
+        actual: String,
+    },
+
     #[error("net: {0}")]
     Net(#[from] crate::net::Error),
 

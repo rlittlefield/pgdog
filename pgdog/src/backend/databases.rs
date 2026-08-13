@@ -296,6 +296,80 @@ pub(crate) async fn persist_config(config: &ConfigAndUsers) -> Result<(), Error>
     Ok(())
 }
 
+/// Drop cached sharding key lookup translations for these values in
+/// every cluster serving the database. Clusters are per (user,
+/// database) pair, each with its own cache, so one database can have
+/// several. The next statement using one of the keys re-runs its
+/// lookup query and reads the current placement.
+pub(crate) fn invalidate_lookup_keys(database: &str, keys: &[String]) {
+    for (user, cluster) in databases().all() {
+        if user.database == database {
+            cluster.invalidate_lookup_keys(keys);
+        }
+    }
+}
+
+/// Build a launched, non-serving one-shard `Cluster` on shard 0 of a
+/// serving database: the arbiter of MOVE KEYS' cross-instance advisory
+/// lock and the medium its cutover hands the coordination seam. The
+/// caller owns it and must shut it down when done: handing out the
+/// serving cluster would kill live pools on its shutdown. Uses the
+/// database's `schema_admin` user's credentials.
+pub(crate) fn medium_cluster(database: &str) -> Result<Cluster, Error> {
+    let config = config();
+    let general = &config.config.general;
+
+    let user = config
+        .users
+        .users
+        .iter()
+        .find(|user| user.database == database && user.schema_admin)
+        .ok_or(Error::NoSchemaAdmin(database.to_string()))?;
+
+    let (number, entry) = config
+        .config
+        .databases
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| {
+            !entry.provisioning
+                && entry.name == database
+                && entry.shard == 0
+                && entry.role == Role::Primary
+        })
+        .ok_or_else(|| Error::NoShardZeroPrimary(database.to_string()))?;
+
+    let primary = PoolConfig {
+        address: Address::new(entry, user, number),
+        config: Config::new(general, entry, user, true),
+    };
+    let shard_configs = vec![ClusterShardConfig {
+        primary: Some(primary),
+        replicas: vec![],
+    }];
+
+    let query_parser = QueryParser {
+        database: database.to_string(),
+        level: general.query_parser,
+        engine: general.query_parser_engine,
+    };
+
+    let cluster_config = ClusterConfig::new(
+        &config.config,
+        user,
+        &shard_configs,
+        ShardedTables::default(),
+        ShardedSchemas::default(),
+        query_parser,
+        SchemaCache::default(),
+    );
+
+    let cluster = Cluster::new(cluster_config);
+    cluster.launch();
+
+    Ok(cluster)
+}
+
 /// Build a launched, non-serving one-shard `Cluster` for a shard being
 /// provisioned by `ADD SHARD`, from its `provisioning = true` entry.
 /// Several future shards can be declared at once; `shard` names the
@@ -652,6 +726,7 @@ fn resolve_sharded_table(
         mapping: mapping.flatten(),
         lookup_query: config.lookup_query.clone(),
         lookup_result: config.lookup_result,
+        move_query: config.move_query.clone(),
     }
 }
 

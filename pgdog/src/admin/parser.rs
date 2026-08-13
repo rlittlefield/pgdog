@@ -38,6 +38,7 @@ pub enum ParseResult {
     Ban(Ban),
     Probe(Probe),
     AddShard(AddShard),
+    MoveKeys(MoveKeys),
     MaintenanceMode(MaintenanceMode),
     OmniWrites(OmniWrites),
     Healthcheck(Healthcheck),
@@ -88,6 +89,7 @@ impl ParseResult {
             Ban(ban) => ban.execute().await,
             Probe(probe) => probe.execute().await,
             AddShard(add_shard) => add_shard.execute().await,
+            MoveKeys(move_keys) => move_keys.execute().await,
             MaintenanceMode(maintenance_mode) => maintenance_mode.execute().await,
             OmniWrites(omni_writes) => omni_writes.execute().await,
             Healthcheck(healthcheck) => healthcheck.execute().await,
@@ -138,6 +140,7 @@ impl ParseResult {
             Ban(ban) => ban.name(),
             Probe(probe) => probe.name(),
             AddShard(add_shard) => add_shard.name(),
+            MoveKeys(move_keys) => move_keys.name(),
             MaintenanceMode(maintenance_mode) => maintenance_mode.name(),
             OmniWrites(omni_writes) => omni_writes.name(),
             Healthcheck(healthcheck) => healthcheck.name(),
@@ -158,7 +161,10 @@ pub struct Parser;
 impl Parser {
     /// Parse the query and return a command we can execute.
     pub fn parse(sql: &str) -> Result<ParseResult, Error> {
-        let sql = sql.trim().replace(";", "").to_lowercase();
+        // Keywords match on the lowercased copy; commands whose
+        // arguments are values (e.g. MOVE KEYS) parse the original.
+        let original = sql.trim().replace(";", "");
+        let sql = original.to_lowercase();
         let mut iter = sql.split(" ");
 
         Ok(match iter.next().ok_or(Error::Syntax)?.trim() {
@@ -229,6 +235,14 @@ impl Parser {
                 "shard" => ParseResult::AddShard(AddShard::parse(&sql)?),
                 command => {
                     debug!("unknown admin add command: '{}'", command);
+                    return Err(Error::Syntax);
+                }
+            },
+            "move" => match iter.next().ok_or(Error::Syntax)?.trim() {
+                // Keys are values: parse the case-preserved input.
+                "keys" => ParseResult::MoveKeys(MoveKeys::parse(&original)?),
+                command => {
+                    debug!("unknown admin move command: '{}'", command);
                     return Err(Error::Syntax);
                 }
             },

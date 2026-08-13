@@ -13,9 +13,11 @@ pub mod add_shard;
 pub mod async_task;
 pub mod copy_data;
 pub mod cutover_registry;
+pub mod move_keys;
 pub mod replication;
 pub mod resharding;
 pub mod schema_sync;
+pub mod topology_guard;
 
 /// Process-global task registry shared by all `crate::api` task modules.
 static TASKS: LazyLock<AsyncTasksStorage> = LazyLock::new(AsyncTasksStorage::default);
