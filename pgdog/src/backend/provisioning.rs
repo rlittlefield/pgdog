@@ -13,6 +13,12 @@
 //! into the new shard's `pgdog.config`; at startup and after every
 //! reload we ask the new shard and re-activate when it reports itself
 //! live.
+//!
+//! The cutover's multi-instance side — pausing omni writes on every
+//! pgdog instance and activating the shard everywhere — runs through
+//! the coordination seam (`fleet::coordination`); this module only
+//! defines its vocabulary: the topic and the states the cutover
+//! publishes.
 
 use std::time::Duration;
 
@@ -25,6 +31,7 @@ use crate::backend::Error;
 use crate::backend::databases::{
     activate_provisioning_shard, databases, persist_config, provisioning_cluster,
 };
+use crate::backend::fleet::coordination::Topic;
 use crate::backend::pool::Request;
 use crate::config::config;
 
@@ -36,6 +43,20 @@ const RETRY_DELAY: Duration = Duration::from_secs(3);
 /// listener opens at startup, and a hanging new shard must not stall
 /// boot (the background retries pick it up).
 const MARKER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// ADD SHARD's coordination, on the new shard as the medium.
+pub(crate) const TOPIC: Topic = Topic::new("add_shard");
+
+/// How long the coordinator waits for every peer to arm its barrier.
+pub(crate) const ARM_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the coordinator waits for every peer to activate. The
+/// activation stands either way; stragglers converge on their own.
+pub(crate) const ACTIVATE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) const STATE_ARMED: &str = "armed";
+pub(crate) const STATE_ACTIVATED: &str = "activated";
+pub(crate) const STATE_RELEASED: &str = "released";
 
 /// Called at startup and after every reload: converge provisioning
 /// entries against what their new shards report.
