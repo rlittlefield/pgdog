@@ -41,9 +41,18 @@ pub(crate) async fn create_publication_on(
         return Err(Error::NoTables);
     }
 
+    // A dot qualifies the schema ("schema.table"); bare names use the
+    // search path, matching how they're declared in the config.
     let table_list = tables
         .iter()
-        .map(|table| format!("\"{}\"", escape_identifier(table)))
+        .map(|table| match table.split_once('.') {
+            Some((schema, name)) => format!(
+                "\"{}\".\"{}\"",
+                escape_identifier(schema),
+                escape_identifier(name)
+            ),
+            None => format!("\"{}\"", escape_identifier(table)),
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let create = format!(
