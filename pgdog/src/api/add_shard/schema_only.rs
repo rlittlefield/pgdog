@@ -84,11 +84,11 @@ async fn activate(
     }
 
     ctx.set_status(AddShardStatus::SwappingTopology);
-    let new_config = activate_provisioning_shard(&task.database, task.shard)
+    activate_provisioning_shard(&task.database, task.shard)
         .await
         .map_err(Error::from)?;
 
-    cutover::finalize(task, &new_config, coordination.as_ref()).await;
+    cutover::finalize(task, coordination.as_ref()).await;
 
     Ok(CutoverOutcome::Done)
 }

@@ -1,7 +1,6 @@
 [general]
 host = "127.0.0.1"
 port = 6499
-cutover_save_config = false
 
 [admin]
 password = "pgdog"

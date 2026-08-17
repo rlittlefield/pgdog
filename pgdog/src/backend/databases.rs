@@ -226,6 +226,8 @@ pub(crate) fn add(user: ConfigUser) -> Result<AuthResult, Error> {
 /// User database references are also swapped.
 /// Persists changes to disk (best effort).
 pub async fn cutover(source: &str, destination: &str) -> Result<(), Error> {
+    use tokio::fs::{copy, write};
+
     let config = {
         let _lock = lock();
 
@@ -244,54 +246,43 @@ pub async fn cutover(source: &str, destination: &str) -> Result<(), Error> {
     info!(r#"databases swapped: "{}" <-> "{}""#, source, destination);
 
     if config.config.general.cutover_save_config {
-        persist_config(&config).await?;
+        if let Err(err) = copy(
+            &config.config_path,
+            config.config_path.clone().with_extension("bak.toml"),
+        )
+        .await
+        {
+            warn!(
+                "{} is read-only, skipping config persistence (err: {})",
+                config
+                    .config_path
+                    .parent()
+                    .map(|path| path.to_owned())
+                    .unwrap_or_default()
+                    .display(),
+                err
+            );
+            return Ok(());
+        }
+
+        copy(
+            &config.users_path,
+            &config.users_path.clone().with_extension("bak.toml"),
+        )
+        .await?;
+
+        write(
+            &config.config_path,
+            toml::to_string_pretty(&config.config)?.as_bytes(),
+        )
+        .await?;
+
+        write(
+            &config.users_path,
+            toml::to_string_pretty(&config.users)?.as_bytes(),
+        )
+        .await?;
     }
-
-    Ok(())
-}
-
-/// Persist the given config to its pgdog.toml/users.toml paths on disk,
-/// backing both up first. Best effort on a read-only config directory:
-/// a failed backup of pgdog.toml logs a warning and skips persistence.
-pub(crate) async fn persist_config(config: &ConfigAndUsers) -> Result<(), Error> {
-    use tokio::fs::{copy, write};
-
-    if let Err(err) = copy(
-        &config.config_path,
-        config.config_path.clone().with_extension("bak.toml"),
-    )
-    .await
-    {
-        warn!(
-            "{} is read-only, skipping config persistence (err: {})",
-            config
-                .config_path
-                .parent()
-                .map(|path| path.to_owned())
-                .unwrap_or_default()
-                .display(),
-            err
-        );
-        return Ok(());
-    }
-
-    copy(
-        &config.users_path,
-        &config.users_path.clone().with_extension("bak.toml"),
-    )
-    .await?;
-
-    write(
-        &config.config_path,
-        toml::to_string_pretty(&config.config)?.as_bytes(),
-    )
-    .await?;
-
-    write(
-        &config.users_path,
-        toml::to_string_pretty(&config.users)?.as_bytes(),
-    )
-    .await?;
 
     Ok(())
 }
@@ -371,15 +362,12 @@ pub(crate) fn provisioning_cluster(database: &str, shard: usize) -> Result<Clust
 
 /// Activate a provisioning shard: flip its `provisioning` flag off in
 /// the running config, validate, and rebuild the databases registry,
-/// all under the config lock. The manifest/config file should be
-/// updated to match before the next restart; persisting (when enabled)
-/// does it automatically. Returns the new config for the caller to
-/// persist. Used by `ADD SHARD` at the point of no return.
-pub(crate) async fn activate_provisioning_shard(
-    database: &str,
-    shard: usize,
-) -> Result<ConfigAndUsers, Error> {
-    let config = {
+/// all under the config lock. The config source is never rewritten:
+/// the shard's own `pgdog.config` marker is what restarts and RELOADs
+/// converge from until the operator removes the flag at the source.
+/// Used by `ADD SHARD` at the point of no return.
+pub(crate) async fn activate_provisioning_shard(database: &str, shard: usize) -> Result<(), Error> {
+    {
         let _lock = lock();
 
         let mut config = config().deref().clone();
@@ -403,16 +391,14 @@ pub(crate) async fn activate_provisioning_shard(
         // The next declared shard (if any) gets its agent, and its
         // convergence check runs, without waiting for a reload.
         crate::backend::provisioning::on_config_change();
-
-        config
-    };
+    }
 
     info!(
         r#"shard {} of database "{}" is now active"#,
         shard, database
     );
 
-    Ok(config)
+    Ok(())
 }
 pub use pgdog_stats::User;
 

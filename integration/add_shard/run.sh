@@ -331,9 +331,10 @@ done
 assert_eq "${LIFECYCLE}" "finished" "auto task finished before restart"
 
 # Restart pgdog with the same config: it still declares shard 2 with
-# provisioning = true (cutover_save_config is off, mimicking a config
-# manifest that wasn't updated yet). The new shard reports itself live
-# in its pgdog.config, so convergence must re-activate it.
+# provisioning = true (the cutover never rewrites the config source,
+# mimicking a config manifest that wasn't updated yet). The new shard
+# reports itself live in its pgdog.config, so convergence must
+# re-activate it.
 stop_pgdog
 start_pgdog
 

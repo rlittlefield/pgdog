@@ -34,9 +34,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend::Cluster;
 use crate::backend::Error;
-use crate::backend::databases::{
-    activate_provisioning_shard, databases, persist_config, provisioning_cluster,
-};
+use crate::backend::databases::{activate_provisioning_shard, databases, provisioning_cluster};
 use crate::backend::fleet::protocol::StateRow;
 use crate::backend::fleet::{Follower, Topic, barrier};
 use crate::backend::pool::Request;
@@ -201,10 +199,7 @@ async fn converge(database: &str, declared: usize) -> Result<bool, Error> {
         r#"shard {} of "{}" was already activated (the shard reports itself live); converging"#,
         declared, database
     );
-    let new_config = activate_provisioning_shard(database, declared).await?;
-    if config().config.general.cutover_save_config {
-        persist_config(&new_config).await?;
-    }
+    activate_provisioning_shard(database, declared).await?;
 
     Ok(true)
 }
@@ -407,16 +402,11 @@ async fn follow_activation(
     armed: &mut bool,
 ) -> Result<(), Error> {
     match activate_provisioning_shard(database, declared).await {
-        Ok(new_config) => {
+        Ok(_) => {
             info!(
                 r#"shard {} of "{}" activated by another instance; following"#,
                 declared, database
             );
-            if config().config.general.cutover_save_config
-                && let Err(err) = persist_config(&new_config).await
-            {
-                warn!("failed to persist config after activation: {}", err);
-            }
         }
         // Already flipped here (e.g. convergence raced us).
         Err(err) => debug!(r#"activation on "{}" already applied: {}"#, database, err),

@@ -14,7 +14,7 @@ use super::{AddShardStatus, AddShardTask, CutoverOutcome};
 use crate::api::MigrationError;
 use crate::api::async_task::AsyncTaskContext;
 use crate::api::cutover_registry;
-use crate::backend::databases::{activate_provisioning_shard, databases, persist_config};
+use crate::backend::databases::{activate_provisioning_shard, databases};
 use crate::backend::fleet::barrier;
 use crate::backend::fleet::{self, Coordinator, Discovery};
 use crate::backend::provisioning;
@@ -183,22 +183,19 @@ pub(super) async fn run(
 
     // Point of no return: no cancellation from here on.
     ctx.set_status(AddShardStatus::SwappingTopology);
-    let new_config = match activate_provisioning_shard(&task.database, task.shard).await {
-        Ok(new_config) => new_config,
-        Err(err) => {
-            // The swap didn't happen; resume the fleet and fail.
-            if let Some(coordination) = &coordination {
-                coordination.publish(provisioning::STATE_RELEASED).await;
-            }
-            return Err(Error::from(err).into());
+    if let Err(err) = activate_provisioning_shard(&task.database, task.shard).await {
+        // The swap didn't happen; resume the fleet and fail.
+        if let Some(coordination) = &coordination {
+            coordination.publish(provisioning::STATE_RELEASED).await;
         }
-    };
+        return Err(Error::from(err).into());
+    }
 
     // Local omni writes are safe the moment the swap lands: they
     // broadcast to all N+1 shards. The peers resume via finalize.
     drop(barrier);
 
-    finalize(task, &new_config, coordination.as_ref()).await;
+    finalize(task, coordination.as_ref()).await;
 
     Ok(CutoverOutcome::Done)
 }
@@ -244,27 +241,12 @@ async fn drain(waiter: &ReplicationWaiter) -> bool {
     }
 }
 
-/// Everything after the swap: persist, refresh `pgdog.config` on every
-/// shard, and activate the peers. The topology has already changed, so
-/// every failure here is warned — with its recovery step — and never
+/// Everything after the swap: refresh `pgdog.config` on every shard
+/// and activate the peers. The topology has already changed, so every
+/// failure here is warned — with its recovery step — and never
 /// propagated: the peers must still hear about the activation, and
 /// stragglers converge on their own.
-pub(super) async fn finalize(
-    task: &AddShardTask,
-    new_config: &pgdog_config::ConfigAndUsers,
-    coordination: Option<&Coordinator>,
-) {
-    // Persist immediately to shrink the crash window between the
-    // in-memory topology and the on-disk config.
-    if new_config.config.general.cutover_save_config
-        && let Err(err) = persist_config(new_config).await
-    {
-        warn!(
-            "[add shard] failed to persist the config: {}; update the config source by hand",
-            err
-        );
-    }
-
+pub(super) async fn finalize(task: &AddShardTask, coordination: Option<&Coordinator>) {
     // Refresh pgdog's own metadata on every shard: the shard total
     // changed cluster-wide, and the new shard's row is the marker
     // restarts converge from.
@@ -294,6 +276,12 @@ pub(super) async fn finalize(
 
     info!(
         "[add shard] shard {} of \"{}\" is now active",
+        task.shard, task.database
+    );
+    warn!(
+        "[add shard] the config source still declares shard {} of \"{}\" as provisioning; \
+         remove its `provisioning = true` line — until then, restarts and RELOADs \
+         converge from the marker in pgdog.config",
         task.shard, task.database
     );
 
