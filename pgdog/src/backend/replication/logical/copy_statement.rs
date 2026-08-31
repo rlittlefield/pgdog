@@ -5,6 +5,7 @@
 use pgdog_config::CopyFormat;
 
 use super::publisher::PublicationTable;
+use crate::util::escape_identifier;
 
 /// COPY statement generator.
 #[derive(Debug, Clone)]
@@ -12,6 +13,10 @@ pub struct CopyStatement {
     table: PublicationTable,
     columns: Vec<String>,
     copy_format: CopyFormat,
+    /// Copy only rows where this column is NULL (`broadcast_null`
+    /// tables). Applies to the source side only: the destination COPY
+    /// receives pre-filtered rows.
+    null_filter_column: Option<String>,
 }
 
 impl CopyStatement {
@@ -32,7 +37,14 @@ impl CopyStatement {
             table: table.clone(),
             columns: columns.to_vec(),
             copy_format,
+            null_filter_column: None,
         }
+    }
+
+    /// Copy only rows where the column is NULL (source side).
+    pub fn with_null_filter(mut self, column: &str) -> Self {
+        self.null_filter_column = Some(column.to_string());
+        self
     }
 
     /// Generate COPY ... TO STDOUT statement.
@@ -63,15 +75,31 @@ impl CopyStatement {
 
     // Generate the statement.
     fn copy(&self, out: bool) -> String {
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| format!(r#""{}""#, c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // `COPY table (...) TO STDOUT` doesn't accept a WHERE clause:
+        // filtered copies use the query form.
+        if out && let Some(column) = &self.null_filter_column {
+            return format!(
+                r#"COPY (SELECT {} FROM "{}"."{}" WHERE "{}" IS NULL) TO STDOUT WITH (FORMAT {})"#,
+                columns,
+                self.schema_name(out),
+                self.table_name(out),
+                escape_identifier(column),
+                self.copy_format
+            );
+        }
+
         format!(
             r#"COPY "{}"."{}" ({}) {} WITH (FORMAT {})"#,
             self.schema_name(out),
             self.table_name(out),
-            self.columns
-                .iter()
-                .map(|c| format!(r#""{}""#, c))
-                .collect::<Vec<_>>()
-                .join(", "),
+            columns,
             if out { "TO STDOUT" } else { "FROM STDIN" },
             self.copy_format
         )
@@ -120,6 +148,30 @@ mod test {
         assert_eq!(
             copy.copy_out(),
             r#"COPY "public"."test_0" ("id", "email") TO STDOUT WITH (FORMAT binary)"#
+        );
+    }
+
+    #[test]
+    fn test_copy_stmt_null_filter() {
+        let table = PublicationTable {
+            schema: "public".into(),
+            name: "packages".into(),
+            ..Default::default()
+        };
+
+        let copy = CopyStatement::new(&table, &["id".into(), "org_id".into()], CopyFormat::Binary)
+            .with_null_filter("org_id");
+
+        // Source side: the query form carries the filter.
+        assert_eq!(
+            copy.copy_out(),
+            r#"COPY (SELECT "id", "org_id" FROM "public"."packages" WHERE "org_id" IS NULL) TO STDOUT WITH (FORMAT binary)"#
+        );
+
+        // Destination side receives pre-filtered rows: plain form.
+        assert_eq!(
+            copy.copy_in(),
+            r#"COPY "public"."packages" ("id", "org_id") FROM STDIN WITH (FORMAT binary)"#
         );
     }
 }

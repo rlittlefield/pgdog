@@ -21,6 +21,7 @@ use crate::backend::replication::logical::Error;
 use crate::backend::replication::logical::add_shard::{
     destination_is_empty, placement_stable, provisioning_lock,
 };
+use crate::backend::replication::logical::publisher::HybridNullTable;
 use crate::config::config;
 
 /// Databases with a topology change (ADD SHARD) in flight *in this
@@ -159,9 +160,12 @@ impl Drop for LockWatchdog {
 pub(super) struct Preflight {
     /// The serving cluster the new shard joins.
     pub(super) source: Cluster,
-    /// The database's omnisharded tables; empty means the schema-only
-    /// path.
+    /// The database's omnisharded tables.
     pub(super) omni_tables: Vec<String>,
+    /// Sharded tables with `broadcast_null`: their NULL-key rows
+    /// replicate to the new shard. Both lists empty means the
+    /// schema-only path.
+    pub(super) hybrid_tables: Vec<HybridNullTable>,
     /// Watches the session holding the session-scoped
     /// `pg_try_advisory_lock` on the new shard: which pgdog instance
     /// runs this ADD SHARD.
@@ -176,6 +180,12 @@ pub(super) struct Preflight {
 impl Preflight {
     pub(super) fn destination(&self) -> &Cluster {
         &self.destination.0
+    }
+
+    /// Tables the publication must cover: the omnisharded tables plus
+    /// the hybrid (`broadcast_null`) tables.
+    pub(super) fn publication_tables(&self) -> Vec<String> {
+        merge_publication_tables(&self.omni_tables, &self.hybrid_tables)
     }
 
     /// Resolves when the provisioning lock's session dies. Exclusivity
@@ -245,18 +255,135 @@ pub(super) async fn preflight(task: &AddShardTask) -> Result<Preflight, Migratio
         .map(|tables| tables.tables.clone())
         .unwrap_or_default();
 
+    let hybrid_tables = hybrid_tables(&source)?;
+
     Ok(Preflight {
         source,
         omni_tables,
+        hybrid_tables,
         lock,
         destination,
         _topology: topology,
     })
 }
 
+/// Omni and hybrid table names, deduped: the config check refuses the
+/// overlap, so the dedupe is defensive.
+fn merge_publication_tables(omni: &[String], hybrid: &[HybridNullTable]) -> Vec<String> {
+    let mut tables = omni.to_vec();
+    for table in hybrid {
+        if !tables.contains(&table.name) {
+            tables.push(table.name.clone());
+        }
+    }
+    tables
+}
+
+/// The cluster's `broadcast_null` tables. A flagged table without a
+/// name can't be enumerated into a publication; the config check
+/// clears the flag in that case, so this refusal is defensive.
+fn hybrid_tables(source: &Cluster) -> Result<Vec<HybridNullTable>, Error> {
+    source
+        .sharded_tables()
+        .iter()
+        .filter(|table| table.broadcast_null)
+        .map(|table| {
+            table
+                .name
+                .as_ref()
+                .map(|name| HybridNullTable {
+                    schema: table.schema.clone(),
+                    name: name.clone(),
+                    column: table.column.clone(),
+                })
+                .ok_or_else(|| Error::BroadcastNullUnnamedTable(table.column.clone()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_merge_publication_tables() {
+        let hybrid = |name: &str| HybridNullTable {
+            schema: None,
+            name: name.into(),
+            column: "org_id".into(),
+        };
+
+        // Hybrid tables append after omni tables; overlap is deduped.
+        assert_eq!(
+            merge_publication_tables(
+                &["orgs".to_string(), "packages".to_string()],
+                &[hybrid("packages"), hybrid("cloud_files")],
+            ),
+            vec!["orgs", "packages", "cloud_files"],
+        );
+        assert_eq!(
+            merge_publication_tables(&[], &[hybrid("packages")]),
+            vec!["packages"],
+        );
+        assert!(merge_publication_tables(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn test_hybrid_tables_from_cluster() {
+        use crate::backend::Cluster;
+        use crate::frontend::router::sharding::ShardedTable;
+        use pgdog_config::ConfigAndUsers;
+
+        let mut cluster = Cluster::new_test(&ConfigAndUsers::default());
+        cluster.set_sharded_tables(crate::backend::ShardedTables::new(
+            vec![
+                ShardedTable {
+                    database: "pgdog".into(),
+                    name: Some("packages".into()),
+                    column: "org_id".into(),
+                    broadcast_null: true,
+                    ..Default::default()
+                },
+                ShardedTable {
+                    database: "pgdog".into(),
+                    name: Some("orders".into()),
+                    column: "org_id".into(),
+                    ..Default::default()
+                },
+            ],
+            vec![],
+            false,
+            pgdog_config::SystemCatalogsBehavior::default(),
+        ));
+
+        let hybrid = hybrid_tables(&cluster).unwrap();
+        assert_eq!(
+            hybrid,
+            vec![HybridNullTable {
+                schema: None,
+                name: "packages".into(),
+                column: "org_id".into(),
+            }]
+        );
+
+        // A nameless flagged table is refused (defensive: the config
+        // check clears the flag before it gets here).
+        cluster.set_sharded_tables(crate::backend::ShardedTables::new(
+            vec![ShardedTable {
+                database: "pgdog".into(),
+                column: "org_id".into(),
+                broadcast_null: true,
+                ..Default::default()
+            }],
+            vec![],
+            false,
+            pgdog_config::SystemCatalogsBehavior::default(),
+        ));
+        assert!(matches!(
+            hybrid_tables(&cluster),
+            Err(Error::BroadcastNullUnnamedTable(_))
+        ));
+    }
 
     #[test]
     fn test_topology_guard_excludes_concurrent_changes() {

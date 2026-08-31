@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::super::{Error, ensure_validation, publisher::Table};
-use super::ReplicationSlot;
+use super::{HybridNullTable, ReplicationSlot};
 
 use crate::backend::replication::logical::subscriber::omni_ownership::OmniOwnership;
 use crate::backend::replication::logical::subscriber::stream::StreamSubscriber;
@@ -59,6 +59,9 @@ pub struct Publisher {
     last_transaction: Arc<Mutex<Option<Instant>>>,
     /// Slot name.
     slot_name: String,
+    /// Sharded tables whose NULL-key rows replicate to the destination
+    /// (`broadcast_null`); empty outside ADD SHARD.
+    hybrid_tables: Vec<HybridNullTable>,
 }
 
 impl Publisher {
@@ -75,7 +78,15 @@ impl Publisher {
             replication_lag: Arc::new(Mutex::new(HashMap::new())),
             last_transaction: Arc::new(Mutex::new(None)),
             slot_name,
+            hybrid_tables: vec![],
         }
+    }
+
+    /// Restrict the given tables to their NULL-key rows during copy
+    /// and replication.
+    pub fn with_hybrid_tables(mut self, hybrid_tables: Vec<HybridNullTable>) -> Self {
+        self.hybrid_tables = hybrid_tables;
+        self
     }
 
     pub fn replication_slot(&self) -> &str {
@@ -99,6 +110,32 @@ impl Publisher {
                 tables.push(table);
             }
         }
+    }
+
+    /// Restrict `broadcast_null` tables to their NULL-key rows: the
+    /// filter rides on the table through both the snapshot copy and
+    /// the replication stream. Matching uses the destination (parent)
+    /// name so leaf partitions inherit the filter; a config without a
+    /// schema matches any schema.
+    fn annotate_hybrid_tables(&self, tables: &mut [Table]) -> Result<(), Error> {
+        for table in tables {
+            let hybrid = self.hybrid_tables.iter().find(|hybrid| {
+                hybrid.matches(
+                    table.table.destination_schema(),
+                    table.table.destination_name(),
+                )
+            });
+            if let Some(hybrid) = hybrid {
+                if !table.columns.iter().any(|col| col.name == hybrid.column) {
+                    return Err(Error::BroadcastNullColumnMissing {
+                        table: table.table.to_string(),
+                        column: hybrid.column.clone(),
+                    });
+                }
+                table.null_filter_column = Some(hybrid.column.clone());
+            }
+        }
+        Ok(())
     }
 
     /// Synchronize tables for all shards.
@@ -130,8 +167,9 @@ impl Publisher {
         for (number, shard) in source.shards().iter().enumerate() {
             // Load tables from publication.
             let mut primary = shard.primary(&Request::default()).await?;
-            let tables =
+            let mut tables =
                 Table::load(&self.publication, &mut primary, self.query_parser_engine).await?;
+            self.annotate_hybrid_tables(&mut tables)?;
 
             // For data sync, split omni tables evenly between shards.
             if data_sync {
@@ -563,7 +601,58 @@ mod test {
             }],
             lsn: Lsn::from_i64(lsn),
             query_parser_engine: QueryParserEngine::default(),
+            null_filter_column: None,
         }
+    }
+
+    #[test]
+    fn annotate_hybrid_tables_sets_filter_and_validates_column() {
+        let publisher = Publisher::new("test", QueryParserEngine::default(), "slot".into())
+            .with_hybrid_tables(vec![HybridNullTable {
+                schema: None,
+                name: "packages".to_string(),
+                column: "tenant_id".to_string(),
+            }]);
+
+        let mut tables = vec![
+            make_table("public", "packages", 0),
+            make_table("public", "orders", 0),
+        ];
+        publisher.annotate_hybrid_tables(&mut tables).unwrap();
+        assert_eq!(tables[0].null_filter_column.as_deref(), Some("tenant_id"));
+        assert_eq!(tables[1].null_filter_column, None);
+
+        // A leaf partition matches through its parent (destination) name.
+        let mut partition = make_table("public", "packages_p0", 0);
+        partition.table.parent_schema = "public".to_string();
+        partition.table.parent_name = "packages".to_string();
+        let mut tables = vec![partition];
+        publisher.annotate_hybrid_tables(&mut tables).unwrap();
+        assert_eq!(tables[0].null_filter_column.as_deref(), Some("tenant_id"));
+
+        // A schema in the config must match.
+        let scoped = Publisher::new("test", QueryParserEngine::default(), "slot".into())
+            .with_hybrid_tables(vec![HybridNullTable {
+                schema: Some("other".to_string()),
+                name: "packages".to_string(),
+                column: "tenant_id".to_string(),
+            }]);
+        let mut tables = vec![make_table("public", "packages", 0)];
+        scoped.annotate_hybrid_tables(&mut tables).unwrap();
+        assert_eq!(tables[0].null_filter_column, None);
+
+        // Missing filter column is refused.
+        let missing = Publisher::new("test", QueryParserEngine::default(), "slot".into())
+            .with_hybrid_tables(vec![HybridNullTable {
+                schema: None,
+                name: "packages".to_string(),
+                column: "no_such_column".to_string(),
+            }]);
+        let mut tables = vec![make_table("public", "packages", 0)];
+        assert!(matches!(
+            missing.annotate_hybrid_tables(&mut tables),
+            Err(Error::BroadcastNullColumnMissing { .. })
+        ));
     }
 
     #[test]

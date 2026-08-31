@@ -40,6 +40,9 @@ pub struct Table {
     pub lsn: Lsn,
     /// Query parser engine.
     pub query_parser_engine: QueryParserEngine,
+    /// Only rows with this column NULL are copied and replicated
+    /// (`broadcast_null` tables during ADD SHARD).
+    pub null_filter_column: Option<String>,
 }
 
 /// An enumerated view over a subset of a table's columns.
@@ -160,6 +163,7 @@ impl Table {
                 columns,
                 lsn: Lsn::default(),
                 query_parser_engine,
+                null_filter_column: None,
             });
         }
 
@@ -559,6 +563,7 @@ mod test {
                 .collect(),
             lsn: Lsn::default(),
             query_parser_engine: QueryParserEngine::default(),
+            null_filter_column: None,
         }
     }
 
@@ -879,6 +884,7 @@ mod test {
             columns,
             lsn: Lsn::default(),
             query_parser_engine: QueryParserEngine::default(),
+            null_filter_column: None,
         }
     }
 

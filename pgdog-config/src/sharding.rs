@@ -46,6 +46,22 @@ pub struct ShardedTableConfig {
     #[serde(default)]
     pub primary: bool,
 
+    /// Declares rows with a NULL sharding key an intentional broadcast set:
+    /// they exist identically on every shard. ADD SHARD copies them to the
+    /// new shard and replicates their changes until the cutover, and the
+    /// cutover briefly pauses writes to this table while the topology swaps,
+    /// exactly like an omnisharded table.
+    ///
+    /// **Note:** Requires `name`. Routing is unchanged: statements with a
+    /// NULL sharding key broadcast to all shards whether or not this is set.
+    /// A value-to-NULL key transition whose other columns include unchanged
+    /// TOAST values can't be reconstructed from WAL during ADD SHARD and is
+    /// reported as a missed row.
+    ///
+    /// _Default:_ `false`
+    #[serde(default)]
+    pub broadcast_null: bool,
+
     /// For vector sharding, specify the centroid vectors directly in the configuration.
     ///
     /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#centroids>

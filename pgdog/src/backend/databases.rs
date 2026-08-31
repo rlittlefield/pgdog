@@ -631,6 +631,7 @@ fn resolve_sharded_table(
         schema: config.schema.as_deref().map(normalize_identifier),
         column: normalize_identifier(&config.column),
         primary: config.primary,
+        broadcast_null: config.broadcast_null,
         centroids: config.centroids.clone(),
         data_type: config.data_type,
         centroid_probes: config.centroid_probes,
