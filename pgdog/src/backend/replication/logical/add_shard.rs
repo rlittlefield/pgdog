@@ -52,7 +52,10 @@ pub(crate) fn placement_stable(cluster: &Cluster) -> Result<(), Error> {
 /// there needs no healthy existing shard. The lock is session-scoped,
 /// so the caller must keep the returned connection checked out for as
 /// long as the task runs; a crashed holder releases it with its
-/// connection.
+/// connection. The reverse is the caller's problem: a session that
+/// dies releases the lock without notifying its holder, so the caller
+/// must probe the connection for as long as it relies on the lock
+/// (the task's `LockWatchdog` does).
 pub(crate) async fn provisioning_lock(cluster: &Cluster) -> Result<Guard, Error> {
     let mut server = cluster
         .shards()
@@ -86,7 +89,7 @@ pub(crate) async fn destination_is_empty(cluster: &Cluster) -> Result<(), Error>
     let tables: Vec<String> = server
         .fetch_all(
             "SELECT table_schema || '.' || table_name FROM information_schema.tables \
-             WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pgdog') \
+             WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pgdog', 'pgdog_fleet') \
              AND table_type = 'BASE TABLE'",
         )
         .await?;

@@ -105,6 +105,11 @@ pub enum Error {
     ProvisioningLocked,
 
     #[error(
+        "the provisioning lock's session died, releasing the lock to other pgdog instances; rerun ADD SHARD"
+    )]
+    ProvisioningLockLost,
+
+    #[error(
         "pgdog instance(s) [{0}] haven't registered on the new shard; deploy the config with the provisioning entry everywhere first"
     )]
     InstancesNotRegistered(String),

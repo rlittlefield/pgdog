@@ -60,12 +60,14 @@ pub(super) enum Parked {
 /// Entry: caught up, replication streaming. Exit: an operator
 /// `CUTOVER` arrived, or the task ended (cancelled, or the stream
 /// finished by itself). Failure: a stream error while parked
-/// propagates.
+/// propagates, and so does losing the provisioning lock's session —
+/// a park can last days, and exclusivity must hold through it.
 pub(super) async fn park(
     task: &AddShardTask,
     ctx: &AsyncTaskContext<AddShardTask>,
     token: &CancellationToken,
     waiter: &mut ReplicationWaiter,
+    preflight: &Preflight,
 ) -> Result<Parked, MigrationError> {
     ctx.set_status(AddShardStatus::AwaitingCutover);
     let cutover =
@@ -76,6 +78,11 @@ pub(super) async fn park(
             waiter.stop();
             waiter.wait().await?;
             Ok(Parked::Ended)
+        }
+        _ = preflight.lock_lost() => {
+            waiter.stop();
+            let _ = waiter.wait().await;
+            Err(Error::ProvisioningLockLost.into())
         }
         _ = cutover.requested() => Ok(Parked::CutoverRequested),
         res = waiter.wait() => {
@@ -112,6 +119,8 @@ pub(super) async fn run(
     waiter: &mut ReplicationWaiter,
     preflight: &Preflight,
 ) -> Result<CutoverOutcome, MigrationError> {
+    preflight.lock_held()?;
+
     // Other pgdog instances must pause their omni writes too. An
     // instance running an older config is in the fleet but not
     // registered on the new shard: refuse rather than diverge.
@@ -175,6 +184,16 @@ pub(super) async fn run(
     let stopped = waiter.wait().await;
     drop(refresh);
     if let Err(err) = stopped {
+        if let Some(coordination) = &coordination {
+            coordination.publish(provisioning::STATE_RELEASED).await;
+        }
+        return Err(err.into());
+    }
+
+    // The swap requires exclusivity: probe the lock's session one
+    // last time, as close to the point of no return as possible. A
+    // dead session means another instance may already hold the lock.
+    if let Err(err) = preflight.ensure_lock_held().await {
         if let Some(coordination) = &coordination {
             coordination.publish(provisioning::STATE_RELEASED).await;
         }

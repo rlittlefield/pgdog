@@ -41,6 +41,7 @@ pub(super) async fn run(
                 cutover_registry::register_cutover(ctx.root_id(), &task.database, Some(task.shard));
             select! {
                 _ = token.cancelled() => return Ok(()),
+                _ = preflight.lock_lost() => return Err(Error::ProvisioningLockLost.into()),
                 _ = cutover.requested() => {}
             }
         } else if token.is_cancelled() {
@@ -82,6 +83,10 @@ async fn activate(
             .await
             .map_err(Error::from)?;
     }
+
+    // The swap requires exclusivity: probe the lock's session one
+    // last time before the point of no return.
+    preflight.ensure_lock_held().await?;
 
     ctx.set_status(AddShardStatus::SwappingTopology);
     activate_provisioning_shard(&task.database, task.shard)

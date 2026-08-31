@@ -156,13 +156,17 @@ impl AddShardTask {
         let slots = orchestrator.publication_guard();
         let result: Result<(), MigrationError> = async {
             let orchestrator = provision::copy_data(self, ctx, orchestrator).await?;
+            // The copy can run for hours: catch a lock lost during it
+            // at the phase boundary. (Losing it mid-copy is contained:
+            // a competing task refuses on the non-empty destination.)
+            preflight.lock_held()?;
             let orchestrator = provision::sync_schema_post(self, ctx, orchestrator).await?;
             let mut waiter = provision::replicate(self, ctx, orchestrator).await?;
 
             // Catch up, then cut over: automatically, or when the
             // operator says so.
             loop {
-                provision::wait_for_catch_up(self, token, &waiter).await?;
+                provision::wait_for_catch_up(self, token, &waiter, preflight).await?;
 
                 // A cancellation during catch-up stops the task. It
                 // must not fall through into the cutover: auto mode
@@ -172,7 +176,7 @@ impl AddShardTask {
                 }
 
                 if !self.auto_cutover {
-                    match cutover::park(self, ctx, token, &mut waiter).await? {
+                    match cutover::park(self, ctx, token, &mut waiter, preflight).await? {
                         cutover::Parked::CutoverRequested => {}
                         cutover::Parked::Ended => return Ok(()),
                     }

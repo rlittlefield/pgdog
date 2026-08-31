@@ -16,6 +16,7 @@ use crate::api::copy_data::CopyDataTask;
 use crate::api::schema_sync::{SchemaSyncPhase, SchemaSyncTask};
 use crate::backend::databases::databases;
 use crate::backend::pool::Request;
+use crate::backend::replication::logical::Error;
 use crate::backend::replication::logical::orchestrator::{Orchestrator, ReplicationWaiter};
 use crate::backend::replication::logical::publisher::publication::{
     create_publication, drop_publication, drop_publication_on,
@@ -148,11 +149,13 @@ pub(super) async fn replicate(
 }
 
 /// Wait until replication lag first drops under the cutover threshold,
-/// or the task is cancelled.
+/// or the task is cancelled. Aborts if the provisioning lock's session
+/// dies while waiting.
 pub(super) async fn wait_for_catch_up(
     task: &AddShardTask,
     token: &CancellationToken,
     waiter: &ReplicationWaiter,
+    preflight: &Preflight,
 ) -> Result<(), MigrationError> {
     let threshold = config().config.general.cutover_replication_lag_threshold;
     let mut check = interval(Duration::from_secs(1));
@@ -160,6 +163,7 @@ pub(super) async fn wait_for_catch_up(
     loop {
         select! {
             _ = token.cancelled() => return Ok(()),
+            _ = preflight.lock_lost() => return Err(Error::ProvisioningLockLost.into()),
             _ = check.tick() => {
                 if let Some(lag) = waiter.lag().await
                     && lag <= threshold
