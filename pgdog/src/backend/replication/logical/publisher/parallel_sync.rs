@@ -12,7 +12,7 @@ use super::super::Error;
 use crate::backend::{
     Cluster, Pool,
     pool::{Address, Request},
-    replication::{publisher::Table, status::TableCopy},
+    replication::{logical::move_keys::KeyMoveScope, publisher::Table, status::TableCopy},
 };
 use crate::frontend::client::query_engine::two_pc::Manager;
 use crate::net::messages::Protocol;
@@ -29,30 +29,35 @@ struct ParallelSync {
     dest: Cluster,
     permit: Arc<Semaphore>,
     cancel: CancellationToken,
+    /// Copy only rows for these sharding keys, to the target shard
+    /// (MOVE KEYS).
+    key_move: Option<Arc<KeyMoveScope>>,
 }
 
 impl ParallelSync {
     // Run parallel sync.
     pub fn run(self) -> JoinHandle<Result<Table, Error>> {
-        tasks::spawn("parallel sync", async move {
-            // Record copy in queue before waiting for permit.
-            let tracker = TableCopy::new(&self.table.table.schema, &self.table.table.name);
+        tasks::spawn("parallel sync", self.task())
+    }
 
-            // This won't acquire until we have at least 1 available permit.
-            // Permit will be given back when this task completes.
-            // acquire_owned() consumes a cloned Arc, returning an OwnedSemaphorePermit with
-            // no lifetime tied to `self`, which allows the subsequent `&mut self` borrow.
-            let _permit = Arc::clone(&self.permit)
-                .acquire_owned()
-                .await
-                .map_err(|_| Error::ParallelConnection)?;
+    async fn task(self) -> Result<Table, Error> {
+        // Record copy in queue before waiting for permit.
+        let tracker = TableCopy::new(&self.table.table.schema, &self.table.table.name);
 
-            if self.cancel.is_cancelled() {
-                return Err(Error::DataSyncAborted);
-            }
+        // This won't acquire until we have at least 1 available permit.
+        // Permit will be given back when this task completes.
+        // acquire_owned() consumes a cloned Arc, returning an OwnedSemaphorePermit with
+        // no lifetime tied to `self`, which allows the subsequent `&mut self` borrow.
+        let _permit = Arc::clone(&self.permit)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::ParallelConnection)?;
 
-            self.run_with_retry(&tracker).await
-        })
+        if self.cancel.is_cancelled() {
+            return Err(Error::DataSyncAborted);
+        }
+
+        self.run_with_retry(&tracker).await
     }
 
     /// Retry loop: attempt the table copy up to `max_retries` times.
@@ -65,14 +70,26 @@ impl ParallelSync {
         loop {
             match self
                 .table
-                .data_sync(&self.addr, &self.source, &self.dest, &self.cancel, tracker)
+                .data_sync(
+                    &self.addr,
+                    &self.source,
+                    &self.dest,
+                    &self.cancel,
+                    tracker,
+                    self.key_move.as_deref(),
+                )
                 .await
             {
                 Ok(_) => return Ok(self.table),
                 Err(err) if !err.is_retryable() || attempt >= max_retries => {
                     tracker.error(&err);
-                    // Terminal failure: warn if rows remain so the operator can truncate.
-                    let _ = self.destination_has_rows().await;
+                    // Terminal failure: warn if rows remain so the operator can
+                    // truncate. Not for a key move: the target legitimately
+                    // holds other tenants' rows, and the task's abort path
+                    // deletes the moved ones.
+                    if self.key_move.is_none() {
+                        let _ = self.destination_has_rows().await;
+                    }
                     return Err(err);
                 }
                 Err(err) => {
@@ -106,12 +123,47 @@ impl ParallelSync {
                     // pool can recover first.
                     // FUTURE: truncate before retry to handle the COPY-committed-but-dropped
                     // race (rows remain → PK violations). Safe once source-guard checks exist.
-                    if self.destination_has_rows().await {
+                    //
+                    // A key move retries differently: the target legitimately
+                    // holds other tenants' rows, so a row probe proves nothing.
+                    // The copy's own rows are precisely identified by the
+                    // predicate: delete them and re-copy.
+                    if let Some(scope) = self.key_move.clone() {
+                        self.delete_moved_rows(&scope).await?;
+                    } else if self.destination_has_rows().await {
                         return Err(err);
                     }
                 }
             }
         }
+    }
+
+    /// Delete this move's rows from the target shard so a retry can
+    /// re-copy them without unique violations.
+    async fn delete_moved_rows(&self, scope: &KeyMoveScope) -> Result<(), Error> {
+        let schema = self.table.table.destination_schema();
+        let name = self.table.table.destination_name();
+        let column = scope
+            .tables()
+            .iter()
+            .find(|table| {
+                table.schema == self.table.table.schema && table.name == self.table.table.name
+            })
+            .map(|table| table.sharding_column.as_str())
+            .ok_or(Error::KeyMoveNoTables)?;
+        let sql = format!(
+            "DELETE FROM \"{}\".\"{}\" WHERE {}",
+            escape_identifier(schema),
+            escape_identifier(name),
+            scope.predicate_sql(column),
+        );
+
+        let mut server = self
+            .dest
+            .primary(scope.target(), &Request::default())
+            .await?;
+        server.execute(sql.as_str()).await?;
+        Ok(())
     }
 
     /// Returns `true` if any reachable destination shard holds rows from a prior COPY
@@ -167,6 +219,7 @@ pub struct ParallelSyncManager {
     replicas: Vec<Pool>,
     source: Cluster,
     dest: Cluster,
+    key_move: Option<Arc<KeyMoveScope>>,
 }
 
 impl ParallelSyncManager {
@@ -176,6 +229,7 @@ impl ParallelSyncManager {
         replicas: Vec<Pool>,
         source: Cluster,
         dest: Cluster,
+        key_move: Option<Arc<KeyMoveScope>>,
     ) -> Result<Self, Error> {
         if replicas.is_empty() {
             return Err(Error::NoReplicas);
@@ -194,6 +248,7 @@ impl ParallelSyncManager {
             replicas,
             source,
             dest,
+            key_move,
         })
     }
 
@@ -215,6 +270,30 @@ impl ParallelSyncManager {
         // beginning once exhausted, giving round-robin distribution across replicas.
         let mut replicas_iter = self.replicas.iter().cycle();
 
+        // A key move copies into a live schema whose foreign keys are
+        // already enforced: tables copy one at a time, in the
+        // parents-first order the caller arranged, so a child row's
+        // parent is committed before the child copies.
+        if self.key_move.is_some() {
+            let mut tables = Vec::with_capacity(self.tables.len());
+            for table in self.tables {
+                let replica = replicas_iter
+                    .next()
+                    .expect("replicas is non-empty; checked in new()");
+                let sync = ParallelSync {
+                    table,
+                    addr: replica.addr().clone(),
+                    source: self.source.clone(),
+                    dest: self.dest.clone(),
+                    permit: self.permit.clone(),
+                    cancel: cancel.clone(),
+                    key_move: self.key_move.clone(),
+                };
+                tables.push(sync.task().await?);
+            }
+            return Ok(tables);
+        }
+
         let mut handles = FuturesUnordered::new();
 
         for table in self.tables {
@@ -230,6 +309,7 @@ impl ParallelSyncManager {
                     dest: self.dest.clone(),
                     permit: self.permit.clone(),
                     cancel: cancel.clone(),
+                    key_move: self.key_move.clone(),
                 }
                 .run(),
             );

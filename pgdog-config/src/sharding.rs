@@ -136,6 +136,20 @@ pub struct ShardedTableConfig {
     /// combined with `shard`: this mode never hashes.
     #[serde(default)]
     pub lookup_result: LookupResult,
+
+    /// UPDATE that reassigns a sharding key to a different shard, e.g.
+    /// `UPDATE tenants SET shard_id = $2 WHERE id = $1`. `$1` is the sharding
+    /// key value and `$2` is the new shard number. Used by `MOVE KEYS` to flip
+    /// a key's placement during the cutover: the query runs on every shard,
+    /// so the table it writes must be omnisharded (the same table
+    /// `lookup_query` reads). A moved key always has a mapping row already,
+    /// so an UPDATE is sufficient.
+    ///
+    /// **Note:** Requires `lookup_query` with `lookup_result = "shard"`:
+    /// moving a single key is only possible when the application owns
+    /// placement.
+    #[serde(default)]
+    pub move_query: Option<String>,
 }
 
 impl ShardedTableConfig {

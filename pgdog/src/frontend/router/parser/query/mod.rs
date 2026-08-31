@@ -132,6 +132,7 @@ impl QueryParser {
                     .extend(std::mem::take(&mut context.bare_key_lookups));
 
                 route.set_pending_lookups(std::mem::take(&mut context.pending_lookups));
+                route.set_sharding_keys(std::mem::take(&mut context.sharding_keys));
 
                 if let Some(role) = context.router_context.sticky.role {
                     match role {
@@ -239,6 +240,12 @@ impl QueryParser {
 
         // Parse hardcoded shard from a query comment.
         if context.router_needed || context.dry_run {
+            // Only present while a keyed write barrier is armed (MOVE
+            // KEYS): a comment-routed write for a paused key parks.
+            if let Some(key) = &statement.comment_sharding_key {
+                context.sharding_keys.push(key.clone());
+            }
+
             let mut comment_shard_set = false;
             match &statement.comment_shard {
                 Some(ShardOrLookup::Shard(comment_shard)) => {
@@ -588,6 +595,7 @@ impl QueryParser {
         let shard = shard.unwrap_or(Shard::All);
         let pending_lookups = parser.take_pending_lookups();
         context.pending_lookups.extend(pending_lookups);
+        context.sharding_keys.extend(parser.take_sharding_keys());
 
         context.shards_calculator.push(if is_sharded {
             ShardWithPriority::new_table(shard.clone())

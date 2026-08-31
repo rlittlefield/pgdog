@@ -540,6 +540,11 @@ impl Cluster {
         self.sharded_tables.tables()
     }
 
+    /// Drop cached sharding key lookup translations for these values.
+    pub fn invalidate_lookup_keys(&self, keys: &[String]) {
+        self.sharded_tables.invalidate_lookup_keys(keys);
+    }
+
     /// Get query rewrite config.
     pub fn rewrite(&self) -> &Rewrite {
         &self.rewrite

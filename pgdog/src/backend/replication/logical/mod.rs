@@ -2,6 +2,7 @@ pub mod add_shard;
 pub mod copy_statement;
 pub mod ee;
 pub mod error;
+pub mod move_keys;
 pub mod orchestrator;
 pub mod publisher;
 pub mod status;

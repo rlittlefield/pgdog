@@ -31,6 +31,9 @@ pub(crate) struct Coordinator {
     topic: Topic,
     epoch: i64,
     me: i64,
+    /// Consumer-defined data riding every state this attempt
+    /// publishes, e.g. which keys a coordinated operation covers.
+    payload: Option<String>,
 }
 
 impl Coordinator {
@@ -63,6 +66,7 @@ impl Coordinator {
             topic,
             epoch: protocol::epoch(),
             me,
+            payload: None,
         };
         let missing = coordinator.stragglers(&registered);
         if missing.is_empty() {
@@ -74,6 +78,15 @@ impl Coordinator {
 
     pub(crate) fn medium(&self) -> &Cluster {
         &self.medium
+    }
+
+    /// Attach consumer-defined data to every state this attempt
+    /// publishes. Followers read it back from the state row; acks
+    /// carry only the state string.
+    // Consumed by the MOVE KEYS cutover.
+    #[allow(dead_code)]
+    pub(crate) fn set_payload(&mut self, payload: String) {
+        self.payload = Some(payload);
     }
 
     /// The peers absent from `acks`, formatted for an error message.
@@ -93,7 +106,15 @@ impl Coordinator {
         state: &str,
         timeout: Duration,
     ) -> Result<Option<String>, Error> {
-        protocol::write_state(&self.medium, self.topic, state, self.epoch, self.me).await?;
+        protocol::write_state(
+            &self.medium,
+            self.topic,
+            state,
+            self.epoch,
+            self.me,
+            self.payload.as_deref(),
+        )
+        .await?;
 
         let deadline = Instant::now() + timeout;
         let mut poll = interval(Duration::from_millis(100));
@@ -111,8 +132,15 @@ impl Coordinator {
 
     /// Publish a state without waiting for acks, best effort.
     pub(crate) async fn publish(&self, state: &str) {
-        if let Err(err) =
-            protocol::write_state(&self.medium, self.topic, state, self.epoch, self.me).await
+        if let Err(err) = protocol::write_state(
+            &self.medium,
+            self.topic,
+            state,
+            self.epoch,
+            self.me,
+            self.payload.as_deref(),
+        )
+        .await
         {
             warn!(
                 r#"failed to publish "{}" for "{}": {}"#,
@@ -130,11 +158,13 @@ impl Coordinator {
     pub(crate) fn keep_fresh(&self, state: &'static str) -> KeepFresh {
         let medium = self.medium.clone();
         let (topic, epoch, me) = (self.topic, self.epoch, self.me);
+        let payload = self.payload.clone();
         KeepFresh(crate::tasks::spawn("fleet state keepalive", async move {
             let mut tick = interval(KEEPALIVE_INTERVAL);
             loop {
                 tick.tick().await;
-                let _ = protocol::write_state(&medium, topic, state, epoch, me).await;
+                let _ = protocol::write_state(&medium, topic, state, epoch, me, payload.as_deref())
+                    .await;
             }
         }))
     }

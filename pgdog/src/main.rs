@@ -125,6 +125,7 @@ async fn pgdog(command: Option<Commands>) -> Result<(), Box<dyn std::error::Erro
     // A crashed instance whose config still carries a provisioning
     // flag re-joins the new topology before serving traffic.
     pgdog::backend::provisioning::converge_at_startup().await;
+    pgdog::backend::key_move::converge_at_startup().await;
 
     let general = &config::config().config.general;
 
@@ -204,6 +205,21 @@ async fn pgdog(command: Option<Commands>) -> Result<(), Box<dyn std::error::Erro
             if let Commands::AddShard { .. } = command {
                 info!("🔄 entering add shard mode");
                 let result = cli::add_shard(command.clone()).await;
+
+                // Wait for the 2PC monitor to drain any in-flight cleanup
+                // before the process exits, even on error.
+                Manager::get().shutdown().await;
+                databases::shutdown();
+
+                if let Err(err) = result {
+                    error!("{}", err);
+                    return Err(err);
+                }
+            }
+
+            if let Commands::MoveKeys { .. } = command {
+                info!("🔄 entering move keys mode");
+                let result = cli::move_keys(command.clone()).await;
 
                 // Wait for the 2PC monitor to drain any in-flight cleanup
                 // before the process exits, even on error.

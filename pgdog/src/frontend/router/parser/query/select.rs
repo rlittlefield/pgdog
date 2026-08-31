@@ -71,7 +71,7 @@ impl QueryParser {
 
         let mut shards = HashSet::new();
 
-        let (shard, is_sharded, tables, pending_lookups) = {
+        let (shard, is_sharded, tables, pending_lookups, sharding_keys) = {
             let mut statement_parser = StatementParser::new(
                 stmt.into(),
                 context.router_context.bind,
@@ -82,9 +82,10 @@ impl QueryParser {
 
             let shard = statement_parser.shard()?;
             let pending_lookups = statement_parser.take_pending_lookups();
+            let sharding_keys = statement_parser.take_sharding_keys();
 
             if shard.is_some() {
-                (shard, true, vec![], pending_lookups)
+                (shard, true, vec![], pending_lookups, sharding_keys)
             } else {
                 (
                     None,
@@ -95,11 +96,13 @@ impl QueryParser {
                     ),
                     statement_parser.extract_tables(),
                     pending_lookups,
+                    sharding_keys,
                 )
             }
         };
 
         context.pending_lookups.extend(pending_lookups);
+        context.sharding_keys.extend(sharding_keys);
 
         if let Some(shard) = shard {
             shards.insert(shard);

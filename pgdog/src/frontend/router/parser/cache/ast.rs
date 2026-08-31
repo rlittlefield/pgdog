@@ -26,6 +26,11 @@ pub struct Ast {
     pub cached: bool,
     /// Shard.
     pub comment_shard: Option<ShardOrLookup>,
+    /// The raw `pgdog_sharding_key` value the comment carried. Only
+    /// recorded while a keyed write barrier is armed (MOVE KEYS).
+    /// Refreshed on every parse alongside `comment_shard`, never
+    /// served stale from the cache.
+    pub comment_sharding_key: Option<String>,
     /// Role.
     pub comment_role: Option<Role>,
     /// Parser query engine used.
@@ -121,6 +126,7 @@ impl Ast {
         Ok(Self {
             cached: true,
             comment_shard: None,
+            comment_sharding_key: None,
             comment_role: None,
             query_parser_engine: schema.query_parser_engine,
             inner: Arc::new(AstInner {
@@ -159,6 +165,7 @@ impl Ast {
             cached: true,
             comment_role: None,
             comment_shard: None,
+            comment_sharding_key: None,
             query_parser_engine,
             inner: Arc::new(AstInner::new(ast.into_inner())),
         })
@@ -170,6 +177,7 @@ impl Ast {
             cached: true,
             comment_role: None,
             comment_shard: None,
+            comment_sharding_key: None,
             query_parser_engine: QueryParserEngine::default(),
             inner: Arc::new(AstInner::new(stmts)),
         }

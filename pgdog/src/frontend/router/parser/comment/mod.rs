@@ -18,6 +18,10 @@ pub struct QueryAndComment<'a> {
     pub comment: String,
     pub role: Option<Role>,
     pub shard: Option<ShardOrLookup>,
+    /// The raw `pgdog_sharding_key` value the comment carried. Only
+    /// recorded while a keyed write barrier is armed (MOVE KEYS), so
+    /// the query engine can park writes for the moving keys.
+    pub sharding_key: Option<String>,
 }
 
 /// Extract SQL C-style block comments from both the beginning and the end
@@ -52,19 +56,21 @@ pub fn parse_edge_comment<'a>(
 
     // Leading wins per-field: extract from leading first, then fill in any
     // fields the leading didn't provide from trailing.
-    let (mut shard, mut role) = match leading {
+    let mut directives = match leading {
         Some(c) => directive::shard_role_from_comment(c, schema)?,
-        None => (None, None),
+        None => Default::default(),
     };
     if let Some(c) = trailing {
-        let (t_shard, t_role) = directive::shard_role_from_comment(c, schema)?;
-        if shard.is_none() {
-            shard = t_shard;
+        let trailing = directive::shard_role_from_comment(c, schema)?;
+        if directives.shard.is_none() {
+            directives.shard = trailing.shard;
+            directives.sharding_key = trailing.sharding_key;
         }
-        if role.is_none() {
-            role = t_role;
+        if directives.role.is_none() {
+            directives.role = trailing.role;
         }
     }
+    let (shard, role, sharding_key) = (directives.shard, directives.role, directives.sharding_key);
 
     Ok(QueryAndComment {
         query: stripped,
@@ -77,5 +83,6 @@ pub fn parse_edge_comment<'a>(
         },
         shard,
         role,
+        sharding_key,
     })
 }

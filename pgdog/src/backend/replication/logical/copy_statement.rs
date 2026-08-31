@@ -13,10 +13,13 @@ pub struct CopyStatement {
     table: PublicationTable,
     columns: Vec<String>,
     copy_format: CopyFormat,
-    /// Copy only rows where this column is NULL (`broadcast_null`
-    /// tables). Applies to the source side only: the destination COPY
-    /// receives pre-filtered rows.
-    null_filter_column: Option<String>,
+    /// Copy only rows matching this WHERE predicate (MOVE KEYS copies
+    /// one set of sharding keys; `broadcast_null` tables copy their
+    /// NULL-key rows). Applies to the source side only: the
+    /// destination COPY receives pre-filtered rows. `COPY (SELECT
+    /// ...)` can't bind parameters, so the predicate arrives with its
+    /// values already quoted.
+    predicate: Option<String>,
 }
 
 impl CopyStatement {
@@ -37,18 +40,37 @@ impl CopyStatement {
             table: table.clone(),
             columns: columns.to_vec(),
             copy_format,
-            null_filter_column: None,
+            predicate: None,
         }
     }
 
-    /// Copy only rows where the column is NULL (source side).
-    pub fn with_null_filter(mut self, column: &str) -> Self {
-        self.null_filter_column = Some(column.to_string());
+    /// Copy out only the rows matching a WHERE predicate.
+    pub fn with_predicate(mut self, predicate: impl Into<String>) -> Self {
+        self.predicate = Some(predicate.into());
         self
+    }
+
+    /// Copy out only rows where the column is NULL (`broadcast_null`
+    /// tables).
+    pub fn with_null_filter(self, column: &str) -> Self {
+        let predicate = format!(r#""{}" IS NULL"#, escape_identifier(column));
+        self.with_predicate(predicate)
     }
 
     /// Generate COPY ... TO STDOUT statement.
     pub fn copy_out(&self) -> String {
+        // `COPY table (...) TO STDOUT` doesn't accept a WHERE clause:
+        // filtered copies use the query form.
+        if let Some(predicate) = &self.predicate {
+            return format!(
+                r#"COPY (SELECT {} FROM "{}"."{}" WHERE {}) TO STDOUT WITH (FORMAT {})"#,
+                self.quoted_columns(),
+                self.schema_name(true),
+                self.table_name(true),
+                predicate,
+                self.copy_format
+            );
+        }
         self.copy(true)
     }
 
@@ -73,33 +95,21 @@ impl CopyStatement {
         }
     }
 
-    // Generate the statement.
-    fn copy(&self, out: bool) -> String {
-        let columns = self
-            .columns
+    fn quoted_columns(&self) -> String {
+        self.columns
             .iter()
             .map(|c| format!(r#""{}""#, c))
             .collect::<Vec<_>>()
-            .join(", ");
+            .join(", ")
+    }
 
-        // `COPY table (...) TO STDOUT` doesn't accept a WHERE clause:
-        // filtered copies use the query form.
-        if out && let Some(column) = &self.null_filter_column {
-            return format!(
-                r#"COPY (SELECT {} FROM "{}"."{}" WHERE "{}" IS NULL) TO STDOUT WITH (FORMAT {})"#,
-                columns,
-                self.schema_name(out),
-                self.table_name(out),
-                escape_identifier(column),
-                self.copy_format
-            );
-        }
-
+    // Generate the statement.
+    fn copy(&self, out: bool) -> String {
         format!(
             r#"COPY "{}"."{}" ({}) {} WITH (FORMAT {})"#,
             self.schema_name(out),
             self.table_name(out),
-            columns,
+            self.quoted_columns(),
             if out { "TO STDOUT" } else { "FROM STDIN" },
             self.copy_format
         )
@@ -172,6 +182,35 @@ mod test {
         assert_eq!(
             copy.copy_in(),
             r#"COPY "public"."packages" ("id", "org_id") FROM STDIN WITH (FORMAT binary)"#
+        );
+    }
+
+    #[test]
+    fn test_copy_stmt_predicate() {
+        let table = PublicationTable {
+            schema: "public".into(),
+            name: "orders".into(),
+            ..Default::default()
+        };
+
+        let copy = CopyStatement::new(
+            &table,
+            &["id".into(), "tenant_id".into()],
+            CopyFormat::Binary,
+        )
+        .with_predicate(r#""tenant_id" = ANY(ARRAY['11', '12'])"#);
+
+        // The predicate filters the copy out.
+        assert_eq!(
+            copy.copy_out(),
+            r#"COPY (SELECT "id", "tenant_id" FROM "public"."orders" WHERE "tenant_id" = ANY(ARRAY['11', '12'])) TO STDOUT WITH (FORMAT binary)"#
+        );
+
+        // The copy in is a plain table copy: the destination takes
+        // every row the filtered copy out produced.
+        assert_eq!(
+            copy.copy_in(),
+            r#"COPY "public"."orders" ("id", "tenant_id") FROM STDIN WITH (FORMAT binary)"#
         );
     }
 }

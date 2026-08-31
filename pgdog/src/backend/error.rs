@@ -66,6 +66,9 @@ pub enum Error {
     #[error("database \"{0}\" has no schema owner")]
     NoSchemaOwner(String),
 
+    #[error("no primary entry for shard 0 of database \"{0}\"")]
+    NoShardZeroPrimary(String),
+
     #[error("{0}")]
     ScramAuth(#[from] crate::auth::scram::Error),
 

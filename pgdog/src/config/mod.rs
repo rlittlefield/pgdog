@@ -76,11 +76,13 @@ pub fn set(mut config: ConfigAndUsers) -> Result<ConfigAndUsers, Error> {
     Ok(config)
 }
 
-/// Validate sharding key lookup queries with the SQL parser:
-/// the query must be syntactically valid, a single statement, and
-/// reference exactly one parameter, `$1`. `lookup_result = "shard"`
-/// requires a lookup query and never hashes, so every hash-related
-/// setting on such a table is a contradiction and fails loudly.
+/// Validate sharding key lookup and move queries with the SQL parser:
+/// each must be syntactically valid, a single statement, and reference
+/// exactly the expected parameters (`$1` for `lookup_query`; `$1` and
+/// `$2` for `move_query`, which must also be an UPDATE).
+/// `lookup_result = "shard"` requires a lookup query and never hashes,
+/// so every hash-related setting on such a table is a contradiction and
+/// fails loudly.
 fn validate_lookup_queries(config: &ConfigAndUsers) -> Result<(), Error> {
     for table in &config.config.sharded_tables {
         let error = |message: String| {
@@ -118,44 +120,90 @@ fn validate_lookup_queries(config: &ConfigAndUsers) -> Result<(), Error> {
             }
         }
 
+        if let Some(query) = &table.move_query {
+            if table.lookup_result != LookupResult::Shard {
+                return Err(error(
+                    "\"move_query\" requires a \"lookup_query\" with \"lookup_result = 'shard'\""
+                        .into(),
+                ));
+            }
+            validate_query(query, &MOVE_QUERY_RULES).map_err(error)?;
+        }
+
         let Some(query) = &table.lookup_query else {
             continue;
         };
 
-        validate_lookup_query(query).map_err(error)?;
+        validate_query(query, &LOOKUP_QUERY_RULES).map_err(error)?;
     }
 
     Ok(())
 }
 
-fn validate_lookup_query(query: &str) -> Result<(), String> {
+/// What a configured query must look like: which setting it came from,
+/// the exact parameter set it must reference (`$1..=$params`), and
+/// whether it has to be an UPDATE. A key being moved always has a
+/// mapping row already (it resolved to its source shard), so the flip
+/// never needs to insert one.
+struct QueryRules {
+    label: &'static str,
+    params: i32,
+    params_hint: &'static str,
+    update: bool,
+}
+
+const LOOKUP_QUERY_RULES: QueryRules = QueryRules {
+    label: "lookup_query",
+    params: 1,
+    params_hint: "exactly one parameter, \"$1\"",
+    update: false,
+};
+
+const MOVE_QUERY_RULES: QueryRules = QueryRules {
+    label: "move_query",
+    params: 2,
+    params_hint: "exactly two parameters, \"$1\" (the key) and \"$2\" (the shard)",
+    update: true,
+};
+
+fn validate_query(query: &str, rules: &QueryRules) -> Result<(), String> {
     use itertools::Itertools;
     use pg_raw_parse::{
         Node,
         walk::{Recurse, walk_manual},
     };
+    use std::collections::HashSet;
     use std::ops::ControlFlow;
 
     let ast = pg_raw_parse::parse(query)
-        .map_err(|err| format!("\"lookup_query\" is invalid: {}", err))?;
+        .map_err(|err| format!("\"{}\" is invalid: {}", rules.label, err))?;
     let stmt = ast
         .stmts()
         .exactly_one()
-        .map_err(|_| "\"lookup_query\" must be a single statement".to_string())?;
+        .map_err(|_| format!("\"{}\" must be a single statement", rules.label))?;
 
-    let mut saw_param = false;
-    let other_param = walk_manual(stmt, |node| match node {
-        Node::ParamRef(param) if param.number != 1 => ControlFlow::Break(()),
-        Node::ParamRef(_) => {
-            saw_param = true;
+    if rules.update && !matches!(stmt, Node::UpdateStmt(_)) {
+        return Err(format!("\"{}\" must be an UPDATE", rules.label));
+    }
+
+    let mut seen = HashSet::new();
+    let out_of_range = walk_manual(stmt, |node| match node {
+        Node::ParamRef(param) if param.number < 1 || param.number > rules.params => {
+            ControlFlow::Break(())
+        }
+        Node::ParamRef(param) => {
+            seen.insert(param.number);
             Recurse::yes()
         }
         _ => Recurse::yes(),
     })
     .is_some();
 
-    if other_param || !saw_param {
-        return Err("\"lookup_query\" must reference exactly one parameter, \"$1\"".into());
+    if out_of_range || seen.len() != rules.params as usize {
+        return Err(format!(
+            "\"{}\" must reference {}",
+            rules.label, rules.params_hint
+        ));
     }
 
     Ok(())
@@ -544,5 +592,84 @@ hasher = "sha1"
         let config = config_with_query("SELECT parent FROM tenants WHERE x = $2");
         let err = validate_lookup_queries(&config).unwrap_err();
         assert!(err.to_string().contains("$1"));
+    }
+
+    fn config_with_move_query(move_query: &str) -> ConfigAndUsers {
+        let source = format!(
+            r#"
+[[sharded_tables]]
+database = "prod"
+column = "tenant_id"
+lookup_query = "SELECT shard_id FROM tenants WHERE id = $1"
+lookup_result = "shard"
+move_query = "{}"
+"#,
+            move_query
+        );
+
+        ConfigAndUsers {
+            config: toml::from_str(&source).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_move_query_valid() {
+        let config = config_with_move_query("UPDATE tenants SET shard_id = $2 WHERE id = $1");
+        validate_lookup_queries(&config).unwrap();
+    }
+
+    #[test]
+    fn test_move_query_requires_shard_lookup() {
+        let config = config_from(
+            r#"
+[[sharded_tables]]
+database = "prod"
+column = "tenant_id"
+move_query = "UPDATE tenants SET shard_id = $2 WHERE id = $1"
+"#,
+        );
+        let err = validate_lookup_queries(&config).unwrap_err();
+        assert!(err.to_string().contains("lookup_result"));
+
+        // A lookup that hashes the translated value can't flip a key
+        // to a chosen shard either.
+        let config = config_from(
+            r#"
+[[sharded_tables]]
+database = "prod"
+column = "tenant_id"
+lookup_query = "SELECT parent FROM tenants WHERE id = $1"
+move_query = "UPDATE tenants SET shard_id = $2 WHERE id = $1"
+"#,
+        );
+        let err = validate_lookup_queries(&config).unwrap_err();
+        assert!(err.to_string().contains("lookup_result"));
+    }
+
+    #[test]
+    fn test_move_query_requires_update() {
+        let config = config_with_move_query("SELECT shard_id FROM tenants WHERE id = $1 OR $2 = 0");
+        let err = validate_lookup_queries(&config).unwrap_err();
+        assert!(err.to_string().contains("must be an UPDATE"));
+
+        let config = config_with_move_query("DELETE FROM tenants WHERE id = $1 AND shard_id = $2");
+        let err = validate_lookup_queries(&config).unwrap_err();
+        assert!(err.to_string().contains("must be an UPDATE"));
+    }
+
+    #[test]
+    fn test_move_query_requires_both_params() {
+        let config = config_with_move_query("UPDATE tenants SET shard_id = 0 WHERE id = $1");
+        let err = validate_lookup_queries(&config).unwrap_err();
+        assert!(err.to_string().contains("$2"));
+
+        let config = config_with_move_query("UPDATE tenants SET shard_id = $2 WHERE id = 1");
+        let err = validate_lookup_queries(&config).unwrap_err();
+        assert!(err.to_string().contains("$2"));
+
+        let config = config_with_move_query("UPDATE tenants SET shard_id = $2 WHERE id = $3");
+        let err = validate_lookup_queries(&config).unwrap_err();
+        assert!(err.to_string().contains("$2"));
     }
 }
