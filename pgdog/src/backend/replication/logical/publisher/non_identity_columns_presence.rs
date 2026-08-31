@@ -130,6 +130,7 @@ mod test {
                 .collect(),
             lsn: Lsn::default(),
             query_parser_engine: QueryParserEngine::default(),
+            null_filter_column: None,
         }
     }
 

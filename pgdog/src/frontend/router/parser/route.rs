@@ -125,6 +125,10 @@ pub struct Route {
     /// This query is only touching omnisharded tables
     /// and requires special checks to be executed.
     omnisharded: bool,
+    /// This write touches a sharded table configured with
+    /// `broadcast_null`: its NULL-key rows broadcast to every shard,
+    /// so it pauses during an ADD SHARD cutover like an omni write.
+    broadcast_null_table: bool,
     /// Sharding key lookups that missed the cache while routing.
     /// The query engine resolves them and routes the query again;
     /// the query doesn't execute while any are unresolved.
@@ -266,6 +270,18 @@ impl Route {
         self.omnisharded
     }
 
+    /// Set the broadcast-null flag on this route.
+    pub fn with_broadcast_null_table(mut self, broadcast_null_table: bool) -> Self {
+        self.broadcast_null_table = broadcast_null_table;
+        self
+    }
+
+    /// The statement touches a sharded table configured with
+    /// `broadcast_null`.
+    pub fn is_broadcast_null_table(&self) -> bool {
+        self.broadcast_null_table
+    }
+
     pub fn is_schema_changed(&self) -> bool {
         self.schema_changed
     }
@@ -287,8 +303,12 @@ impl Route {
     ///
     /// Schema-based sharding intentionally limits the write to the shard selected
     /// by `search_path`; every other omnisharded write requires full coverage.
+    /// A `broadcast_null` table's NULL-key writes broadcast like omni writes;
+    /// its keyed writes route to one shard and are exempt.
     pub(crate) fn requires_full_shard_coverage(&self) -> bool {
-        self.is_omnisharded() && self.is_write() && !self.is_search_path_driven()
+        (self.is_omnisharded() || (self.broadcast_null_table && self.is_all_shards()))
+            && self.is_write()
+            && !self.is_search_path_driven()
     }
 
     /// Return true if this route requires result set manipulation to
@@ -799,6 +819,28 @@ mod test {
         assert!(route.requires_full_shard_coverage());
 
         route.set_search_path_driven(true);
+        assert!(!route.requires_full_shard_coverage());
+    }
+
+    #[test]
+    fn test_broadcast_null_write_coverage() {
+        // NULL-key broadcast write to a flagged table: full coverage.
+        let route =
+            Route::write(ShardWithPriority::new_table(Shard::All)).with_broadcast_null_table(true);
+        assert!(route.requires_full_shard_coverage());
+
+        // Keyed write routes to one shard: exempt.
+        let route = Route::write(ShardWithPriority::new_table(Shard::Direct(1)))
+            .with_broadcast_null_table(true);
+        assert!(!route.requires_full_shard_coverage());
+
+        // Reads never require coverage.
+        let route =
+            Route::read(ShardWithPriority::new_table(Shard::All)).with_broadcast_null_table(true);
+        assert!(!route.requires_full_shard_coverage());
+
+        // Broadcast write to an unflagged sharded table: unchanged.
+        let route = Route::write(ShardWithPriority::new_table(Shard::All));
         assert!(!route.requires_full_shard_coverage());
     }
 }

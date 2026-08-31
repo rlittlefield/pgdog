@@ -77,8 +77,59 @@ pub enum Error {
 
     #[error("router: {0}")]
     Router(#[from] crate::frontend::router::Error),
+
     #[error("sharding key lookup failed: {0}")]
     Lookup(String),
+
+    #[error("no tables to publish")]
+    NoTables,
+
+    #[error("publication \"{0}\" exists with a different table set")]
+    PublicationMismatch(String),
+
+    #[error("publication \"{0}\" has row filters; ADD SHARD requires an unfiltered publication")]
+    PublicationHasRowFilter(String),
+
+    #[error("sharded table with broadcast_null must set a table name (column \"{0}\")")]
+    BroadcastNullUnnamedTable(String),
+
+    #[error(
+        "table \"{table}\" sets broadcast_null on column \"{column}\", but the column does not exist"
+    )]
+    BroadcastNullColumnMissing { table: String, column: String },
+
+    #[error(
+        "sharded table \"{0}\" is routed by hashing; adding a shard would move its rows. \
+         Use lookup_result = \"shard\" or an explicit mapping, or reshard instead"
+    )]
+    PlacementNotStable(String),
+
+    #[error("the new shard is not empty: {0} table(s) exist")]
+    DestinationNotEmpty(usize),
+
+    #[error(
+        "the provisioning shard is declared as shard {declared}, but the next shard is {expected}"
+    )]
+    ProvisioningShardNotNext { declared: usize, expected: usize },
+
+    #[error("another pgdog instance is already provisioning this shard")]
+    ProvisioningLocked,
+
+    #[error(
+        "the provisioning lock's session died, releasing the lock to other pgdog instances; rerun ADD SHARD"
+    )]
+    ProvisioningLockLost,
+
+    #[error(
+        "pgdog instance(s) [{0}] haven't registered on the new shard; deploy the config with the provisioning entry everywhere first"
+    )]
+    InstancesNotRegistered(String),
+
+    #[error("pgdog instance(s) [{0}] didn't pause omni writes in time; retry the cutover")]
+    InstancesNotArmed(String),
+
+    #[error("a topology change for database \"{0}\" is already running")]
+    TopologyChangeInProgress(String),
 
     #[error("net: {0}")]
     Net(#[from] crate::net::Error),

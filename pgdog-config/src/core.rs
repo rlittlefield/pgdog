@@ -299,6 +299,12 @@ impl Config {
     pub fn databases(&self) -> HashMap<String, Vec<Vec<EnumeratedDatabase>>> {
         let mut databases = HashMap::new();
         for (number, database) in self.databases.iter().enumerate() {
+            // Shards being provisioned by ADD SHARD are declared in their
+            // final shape but stay out of the serving topology until the
+            // cutover activates them.
+            if database.provisioning {
+                continue;
+            }
             let entry = databases
                 .entry(database.name.clone())
                 .or_insert_with(Vec::new);
@@ -314,6 +320,14 @@ impl Config {
                 });
         }
         databases
+    }
+
+    /// Shards of a database currently being provisioned by `ADD SHARD`.
+    pub fn provisioning_shards(&self, name: &str) -> Vec<&Database> {
+        self.databases
+            .iter()
+            .filter(|database| database.provisioning && database.name == name)
+            .collect()
     }
 
     pub fn omnisharded_tables(&self) -> HashMap<String, Vec<OmnishardedTable>> {
@@ -399,6 +413,9 @@ impl Config {
     pub fn shard_number_gaps(&self) -> Vec<(String, usize)> {
         let mut shards_by_database: BTreeMap<&str, BTreeSet<usize>> = BTreeMap::new();
         for database in &self.databases {
+            if database.provisioning {
+                continue;
+            }
             shards_by_database
                 .entry(database.name.as_str())
                 .or_default()
@@ -631,6 +648,33 @@ impl Config {
             warn!(
                 "`[[sharded_mappings]]` config is deprecated, use `[[sharded_tables.mapping]]` instead"
             )
+        }
+
+        // broadcast_null needs a table name to enumerate the table into a
+        // publication, and an omnisharded table already replicates fully.
+        for table in &mut self.sharded_tables {
+            if !table.broadcast_null {
+                continue;
+            }
+            let Some(name) = &table.name else {
+                warn!(
+                    r#"sharded table on column "{}" in database "{}" sets "broadcast_null" without "name", ignoring"#,
+                    table.column, table.database,
+                );
+                table.broadcast_null = false;
+                continue;
+            };
+            let omni = self
+                .omnisharded_tables
+                .iter()
+                .any(|omni| omni.database == table.database && omni.tables.contains(name));
+            if omni {
+                warn!(
+                    r#"table "{}" in database "{}" is omnisharded, ignoring "broadcast_null""#,
+                    name, table.database,
+                );
+                table.broadcast_null = false;
+            }
         }
     }
 
@@ -1589,6 +1633,49 @@ column = "legacy_id"
     }
 
     #[test]
+    fn test_broadcast_null_config() {
+        let source = r#"
+[[sharded_tables]]
+database = "db"
+column = "org_id"
+broadcast_null = true
+
+[[sharded_tables]]
+database = "db"
+name = "packages"
+column = "org_id"
+broadcast_null = true
+
+[[sharded_tables]]
+database = "db"
+name = "orgs"
+column = "org_id"
+broadcast_null = true
+
+[[sharded_tables]]
+database = "db"
+name = "orders"
+column = "org_id"
+
+[[omnisharded_tables]]
+database = "db"
+tables = ["orgs"]
+"#;
+        let mut config: Config = toml::from_str(source).unwrap();
+        config.check();
+
+        // Without a name the table can't be enumerated into a
+        // publication: the flag is cleared with a warning.
+        assert!(!config.sharded_tables[0].broadcast_null);
+        // Named, no omni overlap: kept.
+        assert!(config.sharded_tables[1].broadcast_null);
+        // Omnisharded tables already replicate fully: cleared.
+        assert!(!config.sharded_tables[2].broadcast_null);
+        // Defaults to false.
+        assert!(!config.sharded_tables[3].broadcast_null);
+    }
+
+    #[test]
     fn test_sharded_table_separate_mapping() {
         let source = r#"
 [[sharded_tables]]
@@ -1756,5 +1843,44 @@ mod shard_gap_tests {
             config_with_shards(&[1, 2]).shard_number_gaps(),
             vec![("sharded".to_string(), 0)]
         );
+    }
+}
+
+#[cfg(test)]
+mod provisioning_tests {
+    use super::*;
+
+    #[test]
+    fn test_provisioning_excluded_from_topology() {
+        let source = r#"
+[[databases]]
+name = "prod"
+host = "10.0.0.1"
+shard = 0
+
+[[databases]]
+name = "prod"
+host = "10.0.0.2"
+shard = 1
+
+[[databases]]
+name = "prod"
+host = "10.0.0.3"
+shard = 2
+provisioning = true
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+
+        // The serving topology has 2 shards; the provisioning entry is
+        // excluded and doesn't create a gap warning.
+        let databases = config.databases();
+        assert_eq!(databases.get("prod").unwrap().len(), 2);
+        assert!(config.shard_number_gaps().is_empty());
+
+        // But it's discoverable for ADD SHARD.
+        let provisioning = config.provisioning_shards("prod");
+        assert_eq!(provisioning.len(), 1);
+        assert_eq!(provisioning[0].shard, 2);
+        assert_eq!(provisioning[0].host, "10.0.0.3");
     }
 }

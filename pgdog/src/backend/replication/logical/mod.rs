@@ -1,3 +1,4 @@
+pub mod add_shard;
 pub mod copy_statement;
 pub mod ee;
 pub mod error;
@@ -11,6 +12,7 @@ pub use error::*;
 
 use ee::*;
 use orchestrator::*;
+pub use publisher::HybridNullTable;
 pub use publisher::publisher_impl::{Publisher, Waiter};
 pub use subscriber::{CopySubscriber, StreamSubscriber};
 

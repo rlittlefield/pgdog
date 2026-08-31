@@ -148,6 +148,7 @@ mod test {
                 .collect(),
             lsn: Default::default(),
             query_parser_engine: QueryParserEngine::default(),
+            null_filter_column: None,
         }
     }
 

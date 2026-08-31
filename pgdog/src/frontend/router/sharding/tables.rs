@@ -16,6 +16,7 @@ pub struct ShardedTable {
     pub schema: Option<String>,
     pub column: String,
     pub primary: bool,
+    pub broadcast_null: bool,
     pub centroids: Vec<Vector>,
     pub data_type: DataType,
     pub centroid_probes: usize,
