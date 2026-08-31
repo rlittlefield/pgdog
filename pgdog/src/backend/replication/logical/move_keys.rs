@@ -112,19 +112,33 @@ impl KeyMoveScope {
 
     /// A WHERE predicate matching the moving keys' rows, with the
     /// values inlined as quoted literals: used where binding isn't
-    /// possible, e.g. `COPY (SELECT ...)`. Quoted literals are
-    /// unknown-typed, so Postgres coerces them to the column's type.
+    /// possible, e.g. `COPY (SELECT ...)`. The array is cast to the
+    /// sharding column's type: unlike a lone quoted literal, an
+    /// all-unknown ARRAY[...] constructor defaults to text[], and
+    /// `bigint = ANY(text[])` has no operator (SQLSTATE 42883).
     pub fn predicate_sql(&self, column: &str) -> String {
         let mut keys = self.keys.iter().collect::<Vec<_>>();
         keys.sort();
         format!(
-            r#""{}" = ANY(ARRAY[{}])"#,
+            r#""{}" = ANY(ARRAY[{}]::{})"#,
             column,
             keys.iter()
                 .map(|key| quote_literal(key))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            self.sql_array_type()
         )
+    }
+
+    /// The SQL array type `predicate_sql` casts to. Vector can't be a
+    /// key-move sharding type (table enumeration refuses it), so the
+    /// fallback arm only ever serves Varchar.
+    fn sql_array_type(&self) -> &'static str {
+        match self.data_type {
+            DataType::Bigint => "bigint[]",
+            DataType::Uuid => "uuid[]",
+            _ => "text[]",
+        }
     }
 }
 
@@ -529,7 +543,13 @@ mod test {
         .unwrap();
         assert_eq!(
             scope.predicate_sql("tenant_id"),
-            r#""tenant_id" = ANY(ARRAY['Acme', 'O''Brien'])"#
+            r#""tenant_id" = ANY(ARRAY['Acme', 'O''Brien']::text[])"#
+        );
+
+        let scope = KeyMoveScope::new(&["42".into()], 0, 1, tables(DataType::Bigint)).unwrap();
+        assert_eq!(
+            scope.predicate_sql("tenant_id"),
+            r#""tenant_id" = ANY(ARRAY['42']::bigint[])"#
         );
     }
 
