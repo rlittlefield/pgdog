@@ -27,6 +27,12 @@
 //! demoted by a background read, which could race the moment in a
 //! cutover where the topology swapped but the markers aren't stamped
 //! yet.
+//!
+//! The cutover's multi-instance side — pausing omni writes on every
+//! pgdog instance and activating the shard everywhere — runs through
+//! the coordination seam (`fleet::coordination`); this module also
+//! defines its vocabulary: the topic and the states the cutover
+//! publishes.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
@@ -38,6 +44,7 @@ use tracing::{debug, info, warn};
 use crate::backend::Cluster;
 use crate::backend::Error;
 use crate::backend::databases::{reclassify_pending, shard_zero_cluster};
+use crate::backend::fleet::coordination::Topic;
 use crate::backend::pool::Request;
 use crate::config::config;
 
@@ -48,6 +55,20 @@ const RETRY_DELAY: Duration = Duration::from_secs(3);
 /// Bounds each marker read: classification runs before the listener
 /// opens at startup, and a hanging shard 0 must not stall boot.
 const MARKER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// ADD SHARD's coordination, on the new shard as the medium.
+pub(crate) const TOPIC: Topic = Topic::new("add_shard");
+
+/// How long the coordinator waits for every peer to arm its barrier.
+pub(crate) const ARM_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long the coordinator waits for every peer to activate. The
+/// activation stands either way; stragglers converge on their own.
+pub(crate) const ACTIVATE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) const STATE_ARMED: &str = "armed";
+pub(crate) const STATE_ACTIVATED: &str = "activated";
+pub(crate) const STATE_RELEASED: &str = "released";
 
 /// Called after every reload: check pending entries against the
 /// cluster's markers in the background and activate the confirmed
