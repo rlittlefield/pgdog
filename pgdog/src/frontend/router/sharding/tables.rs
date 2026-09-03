@@ -24,6 +24,7 @@ pub(crate) struct ShardedTable {
     pub(crate) mapping: Option<Mapping>,
     pub(crate) lookup_query: Option<String>,
     pub(crate) lookup_result: LookupResult,
+    pub(crate) move_query: Option<String>,
 }
 
 #[derive(Debug)]
