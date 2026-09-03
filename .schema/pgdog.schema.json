@@ -2219,6 +2219,11 @@
       "description": "Configuration for sharding databases. Each entry tells PgDog which column to use as the sharding key for a given table.\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/>",
       "type": "object",
       "properties": {
+        "broadcast_null": {
+          "description": "Declares rows with a NULL sharding key an intentional broadcast set:\nthey exist identically on every shard. ADD SHARD copies them to the\nnew shard and replicates their changes until the cutover, and the\ncutover briefly pauses writes to this table while the topology swaps,\nexactly like an omnisharded table.\n\n**Note:** Requires `name`. Routing is unchanged: statements with a\nNULL sharding key broadcast to all shards whether or not this is set.\nA value-to-NULL key transition whose other columns include unchanged\nTOAST values can't be reconstructed from WAL during ADD SHARD and is\nreported as a missed row.\n\n_Default:_ `false`",
+          "type": "boolean",
+          "default": false
+        },
         "centroid_probes": {
           "description": "Number of centroids to probe during vector similarity search. If not specified, defaults to the square root of the number of centroids.\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#centroid_probes>",
           "type": "integer",

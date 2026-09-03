@@ -15,6 +15,7 @@ pub(crate) struct ShardedTable {
     pub(crate) name: Option<String>,
     pub(crate) schema: Option<String>,
     pub(crate) column: String,
+    pub(crate) broadcast_null: bool,
     pub(crate) primary: bool,
     pub(crate) centroids: Vec<Vector>,
     pub(crate) data_type: DataType,

@@ -671,6 +671,33 @@ impl Config {
                 "`[[sharded_mappings]]` config is deprecated, use `[[sharded_tables.mapping]]` instead"
             )
         }
+
+        // broadcast_null needs a table name to enumerate the table into a
+        // publication, and an omnisharded table already replicates fully.
+        for table in &mut self.sharded_tables {
+            if !table.broadcast_null {
+                continue;
+            }
+            let Some(name) = &table.name else {
+                warn!(
+                    r#"sharded table on column "{}" in database "{}" sets "broadcast_null" without "name", ignoring"#,
+                    table.column, table.database,
+                );
+                table.broadcast_null = false;
+                continue;
+            };
+            let omni = self
+                .omnisharded_tables
+                .iter()
+                .any(|omni| omni.database == table.database && omni.tables.contains(name));
+            if omni {
+                warn!(
+                    r#"table "{}" in database "{}" is omnisharded, ignoring "broadcast_null""#,
+                    name, table.database,
+                );
+                table.broadcast_null = false;
+            }
+        }
     }
 
     /// Multi-tenancy is enabled.
@@ -1746,6 +1773,49 @@ database = "db"
 column = "legacy_id"
 "#;
         assert_mapping_config(&toml::from_str(source).unwrap());
+    }
+
+    #[test]
+    fn test_broadcast_null_config() {
+        let source = r#"
+[[sharded_tables]]
+database = "db"
+column = "org_id"
+broadcast_null = true
+
+[[sharded_tables]]
+database = "db"
+name = "packages"
+column = "org_id"
+broadcast_null = true
+
+[[sharded_tables]]
+database = "db"
+name = "orgs"
+column = "org_id"
+broadcast_null = true
+
+[[sharded_tables]]
+database = "db"
+name = "orders"
+column = "org_id"
+
+[[omnisharded_tables]]
+database = "db"
+tables = ["orgs"]
+"#;
+        let mut config: Config = toml::from_str(source).unwrap();
+        config.check();
+
+        // Without a name the table can't be enumerated into a
+        // publication: the flag is cleared with a warning.
+        assert!(!config.sharded_tables[0].broadcast_null);
+        // Named, no omni overlap: kept.
+        assert!(config.sharded_tables[1].broadcast_null);
+        // Omnisharded tables already replicate fully: cleared.
+        assert!(!config.sharded_tables[2].broadcast_null);
+        // Defaults to false.
+        assert!(!config.sharded_tables[3].broadcast_null);
     }
 
     #[test]
