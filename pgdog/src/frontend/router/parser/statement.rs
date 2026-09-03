@@ -361,6 +361,10 @@ pub(crate) struct StatementParser<'a, 'b, 'c> {
     /// Sharding key lookups that missed the cache and need to be resolved.
     pending_lookups: Vec<PendingLookup>,
     resolved_lookups: Option<&'b ResolvedLookups>,
+    /// Sharding key values seen while routing, in text form. Recorded
+    /// only while a keyed write barrier is armed (MOVE KEYS); empty in
+    /// steady state.
+    sharding_keys: Vec<String>,
 }
 
 impl<'a, 'b: 'a, 'c> StatementParser<'a, 'b, 'c> {
@@ -381,6 +385,7 @@ impl<'a, 'b: 'a, 'c> StatementParser<'a, 'b, 'c> {
             all_omnisharded: None,
             pending_lookups: Vec::new(),
             resolved_lookups: None,
+            sharding_keys: Vec::new(),
         }
     }
 
@@ -801,6 +806,16 @@ impl<'a, 'b: 'a, 'c> StatementParser<'a, 'b, 'c> {
     fn translate_sharding_key(&mut self, table: &ShardedTable, value: &str) -> Option<Arc<str>> {
         let query = table.lookup_query.as_deref()?;
 
+        // While a keyed write barrier is armed (MOVE KEYS), the query
+        // engine parks writes whose keys are paused: record the value
+        // regardless of which path below resolves it. The gate keeps
+        // steady-state routing allocation-free. A statement parsed
+        // just before arming slips through unrecorded, which is safe:
+        // it's an in-flight write during the drain and replicates.
+        if crate::backend::fleet::barrier::any_keys_armed() {
+            self.sharding_keys.push(value.to_owned());
+        }
+
         // Translations resolved for this statement come first: they
         // can't be evicted, unlike cache entries. Both gets run with
         // borrowed keys; the owned key is only built on a miss.
@@ -832,6 +847,12 @@ impl<'a, 'b: 'a, 'c> StatementParser<'a, 'b, 'c> {
     /// Take the pending sharding key lookups recorded while parsing.
     pub(crate) fn take_pending_lookups(&mut self) -> Vec<PendingLookup> {
         std::mem::take(&mut self.pending_lookups)
+    }
+
+    /// Take the sharding key values recorded while parsing. Empty
+    /// unless a keyed write barrier is armed.
+    pub(crate) fn take_sharding_keys(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.sharding_keys)
     }
 
     fn search_stmt(&mut self, stmt: Node<'a>) -> ControlFlow<Result<Shard, Error>> {

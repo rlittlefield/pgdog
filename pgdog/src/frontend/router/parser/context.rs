@@ -57,6 +57,11 @@ pub(crate) struct QueryParserContext<'a> {
     /// the statement is classified: they don't apply to omnisharded
     /// writes, which route to every shard regardless of the key.
     pub(super) bare_key_lookups: Vec<PendingLookup>,
+    /// Sharding key values seen while routing, in text form. Recorded
+    /// only while a keyed write barrier is armed (MOVE KEYS), so the
+    /// query engine can park writes for the moving keys; empty in
+    /// steady state.
+    pub(super) sharding_keys: Vec<String>,
 }
 
 impl<'a> QueryParserContext<'a> {
@@ -75,6 +80,19 @@ impl<'a> QueryParserContext<'a> {
             &sharding_schema,
         )?;
 
+        // While a keyed write barrier is armed (MOVE KEYS), a bare key
+        // set via `SET pgdog.sharding_key` routes this statement:
+        // record it so the query engine can park writes for paused
+        // keys. The gate keeps steady state allocation-free.
+        let mut sharding_keys = Vec::new();
+        if crate::backend::fleet::barrier::any_keys_armed()
+            && sharding_schema.schemas.is_empty()
+            && let Some(crate::net::parameter::ParameterValue::String(val)) =
+                router_context.parameter_hints.pgdog_sharding_key
+        {
+            sharding_keys.push(val.clone());
+        }
+
         Ok(Self {
             read_only: router_context.cluster.read_only(),
             write_only: router_context.cluster.write_only(),
@@ -92,6 +110,7 @@ impl<'a> QueryParserContext<'a> {
             shards_calculator,
             pending_lookups: Vec::new(),
             bare_key_lookups,
+            sharding_keys,
         })
     }
 
