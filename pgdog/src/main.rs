@@ -162,6 +162,9 @@ async fn pgdog(command: Option<Commands>) -> Result<(), Box<dyn std::error::Erro
     // Load databases and connect if needed.
     databases::init()?;
 
+    // Register this instance with the databases it serves.
+    backend::fleet::registry::start();
+
     let general = &config().config.general;
 
     install_log_throttle(general);
@@ -287,6 +290,7 @@ async fn pgdog(command: Option<Commands>) -> Result<(), Box<dyn std::error::Erro
         }
     }
 
+    backend::fleet::registry::deregister().await;
     tasks::shutdown().await;
 
     // Any shutdown routines go below.
@@ -310,6 +314,14 @@ fn install_sigterm_handler() {
         tokio::spawn(async move {
             sigterm.recv().await;
             info!("🐕 PgDog is shutting down immediately [SIGTERM]");
+            // Best-effort, bounded: don't leave a ghost "live" row in
+            // the instance registry (a killed process still does; the
+            // liveness window covers it).
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                backend::fleet::registry::deregister(),
+            )
+            .await;
             exit(0);
         });
     }
