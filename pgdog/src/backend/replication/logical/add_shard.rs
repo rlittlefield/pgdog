@@ -154,4 +154,15 @@ mod test {
         // No sharded tables at all: nothing to destabilize.
         placement_stable(&cluster_with(vec![])).unwrap();
     }
+
+    #[test]
+    fn test_broadcast_null_does_not_exempt_placement() {
+        // broadcast_null only covers the NULL-key rows; the keyed rows
+        // still move under hash routing, so the table is refused.
+        let hashed_hybrid = ShardedTable {
+            broadcast_null: true,
+            ..table()
+        };
+        assert!(placement_stable(&cluster_with(vec![hashed_hybrid])).is_err());
+    }
 }

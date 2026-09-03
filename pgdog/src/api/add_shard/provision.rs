@@ -19,25 +19,25 @@ use crate::backend::pool::Request;
 use crate::backend::replication::logical::Error;
 use crate::backend::replication::logical::orchestrator::{Orchestrator, ReplicationWaiter};
 use crate::backend::replication::logical::publisher::publication::{
-    create_publication, drop_publication, drop_publication_on,
+    create_publication, drop_publication, drop_publication_on, validate_publication_on,
 };
 use crate::config::config;
 use crate::util::random_string;
 use tokio_util::sync::CancellationToken;
 
-/// The publication scoping replication to the omnisharded tables:
-/// operator-supplied ones are trusted and never dropped; auto-created
-/// ones live exactly as long as the task.
+/// The publication scoping replication to the omnisharded and hybrid
+/// (`broadcast_null`) tables: operator-supplied ones are validated and
+/// never dropped; auto-created ones live exactly as long as the task.
 pub(super) struct Publication {
     name: String,
     created: bool,
 }
 
 impl Publication {
-    /// Entry: guards passed, omni tables known. Exit: the publication
-    /// exists on shard 0 and covers exactly the omni tables. Failure:
-    /// nothing to clean up (an existing mismatched publication is
-    /// refused, not altered).
+    /// Entry: guards passed, omni and hybrid tables known. Exit: the
+    /// publication exists on shard 0 and covers exactly those tables,
+    /// with no row filters. Failure: nothing to clean up (an existing
+    /// mismatched publication is refused, not altered).
     pub(super) async fn ensure(
         task: &AddShardTask,
         preflight: &Preflight,
@@ -47,8 +47,23 @@ impl Publication {
             .publication
             .clone()
             .unwrap_or_else(|| format!("__pgdog_add_shard_{}", random_string(12).to_lowercase()));
+        let tables = preflight.publication_tables();
         if created {
-            create_publication(&preflight.source, 0, &name, &preflight.omni_tables).await?;
+            create_publication(&preflight.source, 0, &name, &tables).await?;
+        } else {
+            // Copying and streaming trust the publication's table
+            // list; an operator-supplied one must match it exactly.
+            let shard = preflight
+                .source
+                .shards()
+                .first()
+                .ok_or(crate::backend::pool::Error::NoShard(0))
+                .map_err(Error::from)?;
+            let mut server = shard
+                .primary(&Request::default())
+                .await
+                .map_err(Error::from)?;
+            validate_publication_on(&mut server, &name, &tables).await?;
         }
         Ok(Self { name, created })
     }

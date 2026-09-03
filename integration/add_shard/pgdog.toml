@@ -41,3 +41,18 @@ lookup_result = "shard"
 [[omnisharded_tables]]
 database = "pgdog"
 tables = ["orgs"]
+
+#
+# Hybrid table: keyed rows live on their tenant's shard, NULL-key rows
+# broadcast to every shard. ADD SHARD copies the NULL-key rows to the
+# new shard. Kept last: the schema-only test strips everything from
+# [[omnisharded_tables]] down.
+#
+[[sharded_tables]]
+database = "pgdog"
+name = "packages"
+column = "org_id"
+data_type = "varchar"
+lookup_query = "SELECT shard_id::text FROM orgs WHERE id = $1"
+lookup_result = "shard"
+broadcast_null = true

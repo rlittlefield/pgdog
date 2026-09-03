@@ -21,7 +21,9 @@ use super::super::{
 use super::PipelinedConnection;
 use super::StreamContext;
 use super::omni_ownership::OmniOwnership;
-use crate::net::messages::replication::logical::tuple_data::{Identifier, TupleData};
+use bytes::Bytes;
+
+use crate::net::messages::replication::logical::tuple_data::{Column, Identifier, TupleData};
 use crate::net::messages::replication::logical::update::Update as XLogUpdate;
 use crate::{
     backend::{Cluster, ConnectReason, Server},
@@ -44,6 +46,31 @@ fn statement_name() -> String {
         "__pgdog_repl_{}",
         STATEMENT_COUNTER.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// Key-only tuple in the WAL `'K'` shape: identity columns keep their
+/// values, everything else is NULL (stripped by `Delete::key_non_null`).
+/// Used to convert an UPDATE that leaves a hybrid table's broadcast set
+/// into a DELETE.
+fn identity_key_tuple(new: &TupleData, table: &Table) -> TupleData {
+    TupleData {
+        columns: new
+            .columns
+            .iter()
+            .zip(table.columns.iter())
+            .map(|(column, table_column)| {
+                if table_column.identity {
+                    column.clone()
+                } else {
+                    Column {
+                        identifier: Identifier::Null,
+                        len: 0,
+                        data: Bytes::new(),
+                    }
+                }
+            })
+            .collect(),
+    }
 }
 
 // Unique identifier for a table in Postgres.
@@ -72,6 +99,9 @@ struct Statements {
     /// UPDATE statements keyed by `NonIdentityColumnsPresence` — one per
     /// distinct TOAST-column shape. Shared by DEFAULT/INDEX and FULL identity.
     update_shapes: HashMap<NonIdentityColumnsPresence, Statement>,
+    /// Position of the `broadcast_null` sharding key in the tuple:
+    /// only rows where it's NULL are applied.
+    null_column_idx: Option<usize>,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -237,7 +267,9 @@ impl StreamSubscriber {
     }
 
     // Dispatch a pre-built bind to the matching shard(s).
-    async fn send(&mut self, val: &Shard, bind: Bind) -> Result<(), Error> {
+    // `track_missed` disables missed-row accounting for writes that
+    // legitimately touch zero rows (hybrid-table deletes).
+    async fn send(&mut self, val: &Shard, bind: Bind, track_missed: bool) -> Result<(), Error> {
         // Fail-fast: the replicated transaction spans every shard, so an error
         // latched on any connection means whole transaction is aborted.
         for conn in &self.connections {
@@ -248,7 +280,7 @@ impl StreamSubscriber {
 
         let partition = self.partition;
         let n_conns = self.connections.len();
-        let is_direct = val.is_direct();
+        let is_direct = val.is_direct() && track_missed;
 
         // Runs per replicated change: the common single-target case
         // hands the `Bind` over without cloning it, and multi-target
@@ -280,12 +312,40 @@ impl StreamSubscriber {
         Ok(())
     }
 
+    /// Is the tuple part of a hybrid (`broadcast_null`) table's
+    /// broadcast set? `None`: the table isn't hybrid-filtered.
+    /// `Some(true)`: the sharding key is NULL. `Some(false)`: the key
+    /// has a value — an unchanged-TOAST key is stored out of line,
+    /// hence non-NULL.
+    fn hybrid_member(&self, oid: Oid, tuple: &TupleData) -> Option<bool> {
+        let idx = self.statements.get(&oid)?.null_column_idx?;
+        Some(
+            tuple
+                .columns
+                .get(idx)
+                .is_some_and(|column| column.identifier == Identifier::Null),
+        )
+    }
+
+    /// Is the table hybrid-filtered (`broadcast_null`)?
+    fn is_hybrid(&self, oid: Oid) -> bool {
+        self.statements
+            .get(&oid)
+            .is_some_and(|statements| statements.null_column_idx.is_some())
+    }
+
     // Handle Insert message.
     //
     // Convert Insert into an idempotent "upsert" and apply it to
     // the right shard(s).
     async fn insert(&mut self, insert: XLogInsert) -> Result<(), Error> {
         if self.lsn_applied(&insert.oid) {
+            return Ok(());
+        }
+
+        // Hybrid (broadcast_null) tables replicate only NULL-key rows.
+        if self.hybrid_member(insert.oid, &insert.tuple_data) == Some(false) {
+            self.mark_table_changed(insert.oid);
             return Ok(());
         }
 
@@ -298,7 +358,7 @@ impl StreamSubscriber {
             let ctx = StreamContext::new(&self.cluster, &insert.tuple_data, parse).await?;
             {
                 let (shard, bind) = ctx.into_parts();
-                self.send(&shard, bind).await?;
+                self.send(&shard, bind, true).await?;
             }
         }
 
@@ -346,18 +406,76 @@ impl StreamSubscriber {
                 self.insert(insert).await?;
                 Ok(())
             }
-            UpdateIdentity::Old(_) => {
+            UpdateIdentity::Old(ref old) => {
                 // REPLICA IDENTITY FULL: old row is fully materialised.
                 // If every NEW column is unchanged-TOAST there is nothing to do.
                 if update.new.all_toasted() {
                     self.mark_table_changed(update.oid);
                     return Ok(());
                 }
+                // Hybrid (broadcast_null) tables: membership follows the
+                // new key, taken from the materialised row.
+                if self.is_hybrid(update.oid) {
+                    let complete_new = update.new.fill_toasted_from(old)?;
+                    match self.hybrid_member(update.oid, &complete_new) {
+                        Some(false) => {
+                            // Left the broadcast set (or was never in
+                            // it): remove the row; a no-op when it was
+                            // never on the destination.
+                            let delete = XLogDelete {
+                                oid: update.oid,
+                                key: None,
+                                old: Some(old.clone()),
+                            };
+                            return self.delete(delete).await;
+                        }
+                        Some(true) if self.hybrid_member(update.oid, old) == Some(false) => {
+                            // Entered the broadcast set: materialise the row.
+                            let insert = XLogInsert {
+                                oid: update.oid,
+                                tuple_data: complete_new,
+                            };
+                            return self.insert(insert).await;
+                        }
+                        _ => {}
+                    }
+                }
                 self.update_full_identity(update.oid, update).await
             }
             UpdateIdentity::Nothing => {
                 // Identity columns unchanged; none may be toasted (routing needs them).
                 self.check_toasted_identity(&update)?;
+                // Hybrid (broadcast_null) tables: membership follows the new key.
+                match self.hybrid_member(update.oid, &update.new) {
+                    Some(false) => {
+                        // Left the broadcast set (or was never in it):
+                        // remove the row by its identity; a no-op when
+                        // it was never on the destination.
+                        let table = self.get_table(update.oid)?;
+                        let delete = XLogDelete {
+                            oid: update.oid,
+                            key: Some(identity_key_tuple(&update.new, &table)),
+                            old: None,
+                        };
+                        return self.delete(delete).await;
+                    }
+                    Some(true) if !update.new.has_toasted() => {
+                        // In the broadcast set: the upsert both
+                        // materialises a row that entered it and
+                        // overwrites one that stayed in it.
+                        let insert = XLogInsert {
+                            oid: update.oid,
+                            tuple_data: update.new,
+                        };
+                        return self.insert(insert).await;
+                    }
+                    // Some(true) with unchanged-TOAST columns: the full
+                    // row isn't in the WAL. The partial UPDATE below is
+                    // correct when the row stayed in the set; a row
+                    // *entering* it can't be materialised and surfaces
+                    // as a missed row.
+                    _ => {}
+                }
                 if !update.new.has_toasted() {
                     return self.update_full(update.oid, &update.new).await;
                 }
@@ -392,7 +510,7 @@ impl StreamSubscriber {
         let ctx = StreamContext::new(&self.cluster, new, &parse).await?;
         {
             let (shard, bind) = ctx.into_parts();
-            self.send(&shard, bind).await?;
+            self.send(&shard, bind, true).await?;
         }
         self.mark_table_changed(oid);
         Ok(())
@@ -419,7 +537,7 @@ impl StreamSubscriber {
         let ctx = StreamContext::new(&self.cluster, &partial_new, shape_stmt.parse()).await?;
         {
             let (shard, bind) = ctx.into_parts();
-            self.send(&shard, bind).await?;
+            self.send(&shard, bind, true).await?;
         }
         self.mark_table_changed(oid);
         Ok(())
@@ -555,10 +673,10 @@ impl StreamSubscriber {
         if new_shard != old_shard {
             // Shard key changed: DELETE on old shard, INSERT on new shard.
             let delete_bind = old_full.to_bind(delete_parse.name());
-            self.send(&old_shard, delete_bind).await?;
+            self.send(&old_shard, delete_bind, true).await?;
 
             let insert_bind = complete_new.to_bind(insert_parse.name());
-            self.send(&new_shard, insert_bind).await?;
+            self.send(&new_shard, insert_bind, true).await?;
             self.mark_table_changed(oid);
             return Ok(());
         }
@@ -584,7 +702,7 @@ impl StreamSubscriber {
         // Slow path: WHERE $1..$n (where_tuple=old_full), SET $n+1..$n+k (set_tuple=partial_new).
         let bind =
             XLogUpdate::full_identity_bind_tuple(&where_tuple, &set_tuple).to_bind(parse.name());
-        self.send(&new_shard, bind).await?;
+        self.send(&new_shard, bind, true).await?;
         self.mark_table_changed(oid);
         Ok(())
     }
@@ -630,7 +748,11 @@ impl StreamSubscriber {
         let shard = self.shard_for(&tuple, &delete_parse).await?;
         let bind = tuple.to_bind(delete_parse.name());
 
-        self.send(&shard, bind).await?;
+        // Hybrid (broadcast_null) tables apply every DELETE: keyed rows
+        // aren't on the destination, so zero-row results are expected
+        // and don't count as missed.
+        let track_missed = !self.is_hybrid(oid);
+        self.send(&shard, bind, track_missed).await?;
 
         self.mark_table_changed(oid);
         Ok(())
@@ -725,6 +847,21 @@ impl StreamSubscriber {
             } else {
                 let omni = !table.is_sharded(&self.cluster.sharding_schema().tables);
 
+                // WAL tuples carry columns in `table.columns` order.
+                let null_column_idx = match &table.null_filter_column {
+                    Some(column) => Some(
+                        table
+                            .columns
+                            .iter()
+                            .position(|c| &c.name == column)
+                            .ok_or_else(|| Error::BroadcastNullColumnMissing {
+                                table: table.table.to_string(),
+                                column: column.clone(),
+                            })?,
+                    ),
+                    None => None,
+                };
+
                 let statements = if table.is_identity_full() {
                     // ── FULL identity path ──────────────────────────────────────────────
                     let insert = Statement::new(&table.insert())?;
@@ -765,6 +902,7 @@ impl StreamSubscriber {
                         omni,
                         full_identity: true,
                         update_shapes: HashMap::new(),
+                        null_column_idx,
                     }
                 } else {
                     // ── DEFAULT / INDEX path ────────────────────────────────────────────
@@ -789,6 +927,7 @@ impl StreamSubscriber {
                         omni,
                         full_identity: false,
                         update_shapes: HashMap::new(),
+                        null_column_idx,
                     }
                 };
 

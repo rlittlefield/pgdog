@@ -27,6 +27,7 @@ PGDOG2_PORT=6500
 PGDOG_PID=""
 PGDOG2_PID=""
 WRITER_PID=""
+HYBRID_WRITER_PID=""
 
 app() {
     psql "host=127.0.0.1 port=${PGDOG_PORT} dbname=pgdog user=pgdog password=pgdog" -tAc "$1"
@@ -49,6 +50,10 @@ cleanup() {
     if [ -n "${WRITER_PID}" ]; then
         kill ${WRITER_PID} 2>/dev/null || true
         wait ${WRITER_PID} 2>/dev/null || true
+    fi
+    if [ -n "${HYBRID_WRITER_PID}" ]; then
+        kill ${HYBRID_WRITER_PID} 2>/dev/null || true
+        wait ${HYBRID_WRITER_PID} 2>/dev/null || true
     fi
     if [ -n "${PGDOG2_PID}" ]; then
         kill ${PGDOG2_PID} 2>/dev/null || true
@@ -161,6 +166,29 @@ stop_omni_writer() {
     fi
 }
 
+# NULL-key writes to the hybrid table: they broadcast to every shard,
+# so they park at the same cutover barrier as omni writes. Explicit ids
+# keep the broadcast copies identical across shards.
+start_hybrid_writer() {
+    (
+        i=0
+        while true; do
+            i=$((i + 1))
+            app "INSERT INTO packages (id, org_id, value) VALUES ($((500000 + i)), NULL, 'bg_${i}') ON CONFLICT DO NOTHING" >/dev/null 2>&1 || true
+            sleep 0.1
+        done
+    ) &
+    HYBRID_WRITER_PID=$!
+}
+
+stop_hybrid_writer() {
+    if [ -n "${HYBRID_WRITER_PID}" ]; then
+        kill ${HYBRID_WRITER_PID} 2>/dev/null || true
+        wait ${HYBRID_WRITER_PID} 2>/dev/null || true
+        HYBRID_WRITER_PID=""
+    fi
+}
+
 # wait_for_status TASK_ID STATUS TIMEOUT_SECS
 wait_for_status() {
     local task_id=$1 status=$2 timeout=$3
@@ -186,6 +214,7 @@ wait_for_status() {
 
 reset_all() {
     stop_omni_writer
+    stop_hybrid_writer
     stop_pgdog2
     stop_pgdog
     psql -d pgdog1 -f "${SCRIPT_DIR}/init.sql" >/dev/null
@@ -195,6 +224,12 @@ reset_all() {
     app "INSERT INTO orgs (id, shard_id) VALUES ('org_zero', 0), ('org_one', 1)" >/dev/null
     app "INSERT INTO data (org_id, value) VALUES ('org_zero', 'a')" >/dev/null
     app "INSERT INTO data (org_id, value) VALUES ('org_one', 'b')" >/dev/null
+
+    # Hybrid table: NULL-key rows broadcast to every shard, keyed rows
+    # live with their tenant.
+    app "INSERT INTO packages (id, org_id, value) VALUES (1, NULL, 'global_a'), (2, NULL, 'global_b')" >/dev/null
+    app "INSERT INTO packages (id, org_id, value) VALUES (100, 'org_zero', 'tenant_a')" >/dev/null
+    app "INSERT INTO packages (id, org_id, value) VALUES (101, 'org_one', 'tenant_b')" >/dev/null
 }
 
 assert_eq() {
@@ -210,20 +245,35 @@ pushd "${SCRIPT_DIR}" >/dev/null
 echo "=== Test A: parked cutover with live omni writes ==="
 reset_all
 start_omni_writer
+start_hybrid_writer
 sleep 1
 
 TASK_ID=$(admin "ADD SHARD pgdog 2")
 echo "task: ${TASK_ID}"
 wait_for_status "${TASK_ID}" "awaiting cutover" 120
 
-# The writer kept making progress while the task parked.
+# The writers kept making progress while the task parked.
 BEFORE=$(app "SELECT count(*) FROM orgs")
+HYBRID_BEFORE=$(app "SELECT count(*) FROM packages WHERE org_id IS NULL")
 sleep 2
 AFTER=$(app "SELECT count(*) FROM orgs")
+HYBRID_AFTER=$(app "SELECT count(*) FROM packages WHERE org_id IS NULL")
 if [ "${AFTER}" -le "${BEFORE}" ]; then
     echo "ASSERTION FAILED: omni writer stalled while task parked"
     exit 1
 fi
+if [ "${HYBRID_AFTER}" -le "${HYBRID_BEFORE}" ]; then
+    echo "ASSERTION FAILED: hybrid NULL-key writer stalled while task parked"
+    exit 1
+fi
+
+# Hybrid transitions while replication streams: a fresh NULL row and a
+# fresh keyed row, a NULL row leaving the broadcast set, and a keyed
+# row entering it.
+app "INSERT INTO packages (id, org_id, value) VALUES (3, NULL, 'global_c')" >/dev/null
+app "INSERT INTO packages (id, org_id, value) VALUES (102, 'org_zero', 'tenant_c')" >/dev/null
+app "UPDATE packages SET org_id = 'org_zero' WHERE id = 1" >/dev/null
+app "UPDATE packages SET org_id = NULL WHERE id = 100 AND org_id = 'org_zero'" >/dev/null
 
 admin "CUTOVER ${TASK_ID}" >/dev/null
 wait_for_status "${TASK_ID}" "swapping topology" 60 || true
@@ -235,6 +285,7 @@ done
 assert_eq "${LIFECYCLE}" "finished" "task finished"
 
 stop_omni_writer
+stop_hybrid_writer
 sleep 1
 
 # Omni rows on the new shard match shard 0, including rows written
@@ -242,6 +293,21 @@ sleep 1
 SRC_COUNT=$(direct pgdog1 "SELECT count(*) FROM orgs")
 NEW_COUNT=$(direct shard_0 "SELECT count(*) FROM orgs")
 assert_eq "${SRC_COUNT}" "${NEW_COUNT}" "omni rows caught up on the new shard"
+
+# Hybrid NULL-key rows on the new shard match shard 0, including the
+# background writer's rows and the keyed row that flipped to NULL.
+SRC_NULLS=$(direct pgdog1 "SELECT count(*) FROM packages WHERE org_id IS NULL")
+NEW_NULLS=$(direct shard_0 "SELECT count(*) FROM packages WHERE org_id IS NULL")
+assert_eq "${SRC_NULLS}" "${NEW_NULLS}" "hybrid NULL-key rows caught up on the new shard"
+ENTERED=$(direct shard_0 "SELECT count(*) FROM packages WHERE id = 100 AND org_id IS NULL")
+assert_eq "${ENTERED}" "1" "keyed row that flipped to NULL materialized on the new shard"
+
+# No keyed rows leaked: the flipped-to-keyed row was removed and the
+# fresh keyed row was never copied.
+KEYED_ON_NEW=$(direct shard_0 "SELECT count(*) FROM packages WHERE org_id IS NOT NULL")
+assert_eq "${KEYED_ON_NEW}" "0" "no keyed hybrid rows on the new shard"
+LEFT=$(direct shard_0 "SELECT count(*) FROM packages WHERE id = 1")
+assert_eq "${LEFT}" "0" "NULL row that flipped to keyed removed from the new shard"
 
 # No replication slots left behind.
 SLOTS=$(direct pgdog1 "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE '__pgdog%'")
@@ -254,6 +320,11 @@ ROUTED=$(app "SELECT count(*) FROM data WHERE org_id = 'org_two'")
 assert_eq "${ROUTED}" "1" "new tenant readable through pgdog"
 ON_NEW=$(direct shard_0 "SELECT count(*) FROM data WHERE org_id = 'org_two'")
 assert_eq "${ON_NEW}" "1" "new tenant's row landed on the new shard"
+
+# A NULL-key hybrid write after the cutover broadcasts to the new shard.
+app "INSERT INTO packages (id, org_id, value) VALUES (4, NULL, 'global_d')" >/dev/null
+ON_NEW=$(direct shard_0 "SELECT count(*) FROM packages WHERE id = 4")
+assert_eq "${ON_NEW}" "1" "post-cutover NULL-key write reached the new shard"
 
 echo "=== Test B: automatic cutover ==="
 reset_all
@@ -272,6 +343,11 @@ assert_eq "${LIFECYCLE}" "finished" "auto task finished"
 SRC_COUNT=$(direct pgdog1 "SELECT count(*) FROM orgs")
 NEW_COUNT=$(direct shard_0 "SELECT count(*) FROM orgs")
 assert_eq "${SRC_COUNT}" "${NEW_COUNT}" "omni rows on the new shard (auto)"
+SRC_NULLS=$(direct pgdog1 "SELECT count(*) FROM packages WHERE org_id IS NULL")
+NEW_NULLS=$(direct shard_0 "SELECT count(*) FROM packages WHERE org_id IS NULL")
+assert_eq "${SRC_NULLS}" "${NEW_NULLS}" "hybrid NULL-key rows on the new shard (auto)"
+KEYED_ON_NEW=$(direct shard_0 "SELECT count(*) FROM packages WHERE org_id IS NOT NULL")
+assert_eq "${KEYED_ON_NEW}" "0" "no keyed hybrid rows on the new shard (auto)"
 
 echo "=== Test C: abort mid-task leaves topology unchanged ==="
 reset_all
@@ -431,10 +507,12 @@ assert_eq "${LIFECYCLE}" "finished" "cutover finished after the dead peer expire
 
 echo "=== Test H: schema-only add shard without omnisharded tables ==="
 reset_all
-# Same topology, but no omnisharded tables declared: the task syncs
-# schema only and skips the copy, replication, and write pause.
+# Same topology, but no omnisharded or broadcast_null tables declared:
+# the task syncs schema only and skips the copy, replication, and
+# write pause. The omnisharded and hybrid blocks sit at the end of the
+# config, so everything from [[omnisharded_tables]] down goes.
 stop_pgdog
-sed '/\[\[omnisharded_tables\]\]/,+2d' "${PGDOG_CONFIG}" > "${SCRIPT_DIR}/pgdog_ddl.toml"
+sed '/\[\[omnisharded_tables\]\]/,$d' "${PGDOG_CONFIG}" > "${SCRIPT_DIR}/pgdog_ddl.toml"
 start_pgdog "${SCRIPT_DIR}/pgdog_ddl.toml"
 
 TASK_ID=$(admin "ADD SHARD pgdog 2 AUTO")

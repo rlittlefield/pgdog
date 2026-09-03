@@ -1,3 +1,4 @@
+use super::publisher::HybridNullTable;
 use crate::api::replication::ReplicationTask;
 use crate::api::schema_sync::{SchemaSyncPhase, SchemaSyncTask};
 use crate::api::task::TaskContext;
@@ -32,6 +33,9 @@ pub(crate) struct Orchestrator {
     /// The destination is caller-owned (a provisioning shard's cluster),
     /// not a config database: `refresh()` must not re-resolve it.
     fixed_destination: bool,
+    /// Sharded tables whose NULL-key rows replicate to the new shard
+    /// (`broadcast_null`); empty outside ADD SHARD.
+    hybrid_tables: Vec<HybridNullTable>,
     /// Dump and restore schema without a publication: nothing is
     /// copied or replicated, so no publication is required to exist.
     schema_only: bool,
@@ -74,6 +78,7 @@ impl Orchestrator {
             replication_slot,
             source_shard: None,
             fixed_destination: false,
+            hybrid_tables: vec![],
             schema_only: false,
         };
 
@@ -90,6 +95,7 @@ impl Orchestrator {
         destination: Cluster,
         publication: &str,
         source_shard: usize,
+        hybrid_tables: Vec<HybridNullTable>,
     ) -> Result<Self, Error> {
         let source = databases().schema_owner(source)?;
 
@@ -103,6 +109,7 @@ impl Orchestrator {
             replication_slot,
             source_shard: None,
             fixed_destination: true,
+            hybrid_tables,
             schema_only: false,
         };
         orchestrator.refresh_publisher();
@@ -140,7 +147,8 @@ impl Orchestrator {
     /// Replace the publisher entirely (discards LSN state).  Only valid
     /// when starting a fresh replication phase, e.g. after cutover.
     pub(crate) fn refresh_publisher(&mut self) {
-        let publisher = Publisher::new(&self.publication, self.replication_slot.clone());
+        let publisher = Publisher::new(&self.publication, self.replication_slot.clone())
+            .with_hybrid_tables(self.hybrid_tables.clone());
         self.publisher = Arc::new(Mutex::new(publisher));
     }
 
@@ -601,6 +609,7 @@ mod tests {
                 replication_slot,
                 source_shard: None,
                 fixed_destination: false,
+                hybrid_tables: vec![],
                 schema_only: false,
             }
         }

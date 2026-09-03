@@ -2,12 +2,13 @@
 //!
 //! Provisions a new shard for a cluster whose sharded tables are
 //! placement-stable (`lookup_result = "shard"` or explicit mappings):
-//! syncs DDL, snapshot-copies omnisharded tables from shard 0, streams
-//! WAL until the new shard has caught up, then — on operator `CUTOVER`
-//! or automatically — pauses omnisharded writes fleet-wide, drains
-//! replication to zero, activates the shard in the topology, and
-//! resumes. Sharded traffic and all reads flow throughout; only omni
-//! writes pause, for the sub-second drain.
+//! syncs DDL, snapshot-copies omnisharded tables — and the NULL-key
+//! rows of `broadcast_null` tables — from shard 0, streams WAL until
+//! the new shard has caught up, then — on operator `CUTOVER` or
+//! automatically — pauses omnisharded and `broadcast_null` writes
+//! fleet-wide, drains replication to zero, activates the shard in the
+//! topology, and resumes. Sharded traffic and all reads flow
+//! throughout; only those writes pause, for the sub-second drain.
 //!
 //! The destination is the shard declared with `provisioning = true` in
 //! the config: declared in its final shape, excluded from the serving
@@ -55,7 +56,9 @@ pub(crate) struct AddShardTask {
     /// `provisioning = true` entries.
     pub shard: usize,
     /// Operator-supplied publication; when absent, one is created for
-    /// the omnisharded tables and dropped when the task ends.
+    /// the omnisharded and `broadcast_null` tables and dropped when
+    /// the task ends. A supplied one must cover exactly those tables,
+    /// with no row filters.
     pub publication: Option<String>,
     /// Cut over automatically once the new shard has caught up,
     /// instead of waiting for an operator `CUTOVER`.
@@ -86,20 +89,22 @@ impl Task for AddShardTask {
         ctx.set_status(AddShardStatus::Validating);
         let preflight = guards::preflight(&self).await?;
 
-        // With no omnisharded tables there is nothing to copy or
-        // stream, and no writes to pause: sync the schema and activate.
-        if preflight.omni_tables.is_empty() {
+        // With no omnisharded or hybrid (broadcast_null) tables there
+        // is nothing to copy or stream, and no writes to pause: sync
+        // the schema and activate.
+        if preflight.omni_tables.is_empty() && preflight.hybrid_tables.is_empty() {
             return schema_only::run(&self, &ctx, &token, &preflight).await;
         }
 
-        // Publication for the omni tables; dropped when the task ends
-        // unless the operator owns it.
+        // Publication for the omni and hybrid tables; dropped when the
+        // task ends unless the operator owns it.
         let publication = Publication::ensure(&self, &preflight).await?;
         let orchestrator = Orchestrator::for_provisioning(
             &self.database,
             preflight.destination().clone(),
             publication.name(),
             0,
+            preflight.hybrid_tables.clone(),
         )?;
 
         let result = self

@@ -86,6 +86,17 @@ pub(crate) enum Error {
     #[error("publication \"{0}\" exists with a different table set")]
     PublicationMismatch(String),
 
+    #[error("publication \"{0}\" has row filters; ADD SHARD requires an unfiltered publication")]
+    PublicationHasRowFilter(String),
+
+    #[error("sharded table with broadcast_null must set a table name (column \"{0}\")")]
+    BroadcastNullUnnamedTable(String),
+
+    #[error(
+        "table \"{table}\" sets broadcast_null on column \"{column}\", but the column does not exist"
+    )]
+    BroadcastNullColumnMissing { table: String, column: String },
+
     #[error(
         "sharded table \"{0}\" is routed by hashing; adding a shard would move its rows. \
          Use lookup_result = \"shard\" or an explicit mapping, or reshard instead"

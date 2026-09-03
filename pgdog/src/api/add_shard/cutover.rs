@@ -228,9 +228,9 @@ async fn drain(waiter: &ReplicationWaiter) -> bool {
     let timeout = Duration::from_millis(general.cutover_timeout);
     let timeout_action = general.cutover_timeout_action;
 
-    // In-flight omni writes finish and replicate; new ones park at the
-    // barrier. Sharded-table WAL doesn't hold the lag up — keepalives
-    // advance past unpublished changes.
+    // In-flight omni and broadcast_null writes finish and replicate;
+    // new ones park at the barrier. Unpublished sharded-table WAL
+    // doesn't hold the lag up — keepalives advance past it.
     let started = Instant::now();
     let mut check = interval(Duration::from_millis(50));
     loop {
