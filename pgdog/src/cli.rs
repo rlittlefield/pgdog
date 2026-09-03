@@ -6,6 +6,7 @@ use tracing::{info, warn};
 
 use crate::api::Task;
 use crate::api::add_shard::AddShardTask;
+use crate::api::move_keys::MoveKeysTask;
 use crate::api::resharding::ReshardTask;
 use crate::api::run_task;
 use crate::api::schema_sync::{SchemaSyncPhase, SchemaSyncTask};
@@ -123,6 +124,27 @@ pub(crate) enum Commands {
         /// Publication to use; created automatically when omitted.
         #[arg(long)]
         publication: Option<String>,
+
+        /// Cut over automatically once caught up instead of waiting
+        /// for an operator CUTOVER.
+        #[arg(long, default_value = "false")]
+        auto_cutover: bool,
+    },
+
+    /// Move sharding keys to another shard.
+    MoveKeys {
+        /// Database whose keys move.
+        #[arg(long)]
+        database: String,
+
+        /// The shard the keys move to.
+        #[arg(long)]
+        target: usize,
+
+        /// The sharding key values to move; all must currently live
+        /// on the same shard.
+        #[arg(long, required = true, num_args = 1..)]
+        keys: Vec<String>,
 
         /// Cut over automatically once caught up instead of waiting
         /// for an operator CUTOVER.
@@ -303,6 +325,28 @@ pub(crate) async fn add_shard(commands: Commands) -> Result<(), Box<dyn std::err
                 .database(database)
                 .shard(shard)
                 .maybe_publication(publication)
+                .auto_cutover(auto_cutover)
+                .build(),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn move_keys(commands: Commands) -> Result<(), Box<dyn std::error::Error>> {
+    if let Commands::MoveKeys {
+        database,
+        target,
+        keys,
+        auto_cutover,
+    } = commands
+    {
+        run_to_completion(
+            MoveKeysTask::builder()
+                .database(database)
+                .target(target)
+                .keys(keys)
                 .auto_cutover(auto_cutover)
                 .build(),
         )

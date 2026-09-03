@@ -13,7 +13,6 @@ use task::{TaskError, TaskStorage, TaskWaiter};
 pub(crate) mod add_shard;
 pub(crate) mod copy_data;
 pub(crate) mod cutover_registry;
-#[allow(dead_code)] // TODO: remove once the MOVE KEYS admin command lands
 pub(crate) mod move_keys;
 pub(crate) mod replication;
 pub(crate) mod resharding;
