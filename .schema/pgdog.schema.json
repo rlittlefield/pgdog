@@ -2256,6 +2256,11 @@
           "$ref": "#/$defs/Hasher",
           "default": "postgres"
         },
+        "kind": {
+          "description": "What kind of sharded table this is. A `hybrid` table's sharding\ncolumn is nullable and its NULL-key rows exist identically on\nevery shard: ADD SHARD copies them to the new shard and\nreplicates their changes until the cutover, cutovers briefly\npause the table's writes while the topology swaps (like an\nomnisharded table), and MOVE KEYS requires `REPLICA IDENTITY\nFULL` on it, since a nullable column can never be part of an\nidentity index.\n\n**Note:** `hybrid` requires `name`. Routing is unchanged:\nstatements with a NULL sharding key broadcast to all shards\nwhatever the kind. A value-to-NULL key transition whose other\ncolumns include unchanged TOAST values can't be reconstructed\nfrom WAL during ADD SHARD and is reported as a missed row.\n\n_Default:_ `sharded`",
+          "$ref": "#/$defs/TableKind",
+          "default": "sharded"
+        },
         "lookup_query": {
           "description": "Query used to translate a sharding key value into the value that's hashed\nto pick a shard, e.g. `SELECT COALESCE(parent_org_id, id) FROM orgs\nWHERE id = $1`. Must contain exactly one `$1` placeholder and return at\nmost one row. Results are cached in memory, keyed by the value; the\ncache is emptied on config reload.\n\n**Note:** The query should return a row for every valid sharding key\nvalue, including values that translate to themselves. A value with no\nrow fails the statement with an error: routing it by its original value\ncould place data on the wrong shard, e.g. when the row just hasn't been\ninserted yet. Absence isn't cached, so rows added later are picked up\non the next statement.\n\n**Note:** The table the query reads must contain the same data on all\nshards (omnisharded): the query runs on a single shard picked\nround-robin.",
           "type": [
@@ -2323,6 +2328,21 @@
           "description": "Route catalog queries using the normal sharding key, like any other table.",
           "type": "string",
           "const": "sharded"
+        }
+      ]
+    },
+    "TableKind": {
+      "description": "Kind of sharded table.",
+      "oneOf": [
+        {
+          "description": "Every row lives on the shard its key routes to (default).",
+          "type": "string",
+          "const": "sharded"
+        },
+        {
+          "description": "The sharding column is nullable; NULL-key rows exist on every shard.",
+          "type": "string",
+          "const": "hybrid"
         }
       ]
     },

@@ -268,7 +268,14 @@ impl<'a> StatementRewrite<'a> {
         let Some(shard_key_assignment) = stmt.target_list().into_iter().find(|c| {
             Column::try_from(*c).is_ok_and(|mut c| {
                 c.qualify(table);
-                self.schema.tables().get_table(c).is_some()
+                // Hybrid tables are exempt: their NULL-key rows exist
+                // on every shard, so the move-row rewrite's single-home
+                // assumption doesn't hold. Their key updates route as
+                // plain writes.
+                self.schema
+                    .tables()
+                    .get_table(c)
+                    .is_some_and(|table| !table.is_hybrid())
             })
         }) else {
             return Ok(None);
@@ -477,6 +484,61 @@ mod test {
             &mut plan,
         )?;
         Ok(plan.sharding_key_update)
+    }
+
+    #[test]
+    fn test_hybrid_table_key_update_not_rewritten() {
+        // Hybrid rows exist on every shard (NULL keys): no single home
+        // to move the row from, so the rewrite must leave the UPDATE
+        // alone and let it route as a plain write.
+        let mut schema = default_schema();
+        // The column-only rule comes first on purpose: the named
+        // hybrid rule must still win the match (named-first
+        // precedence), or the rewrite classifies through the generic
+        // rule and misses the exemption.
+        schema.tables = ShardedTables::new(
+            vec![
+                ShardedTable {
+                    database: "pgdog".into(),
+                    column: "id".into(),
+                    ..Default::default()
+                },
+                ShardedTable {
+                    database: "pgdog".into(),
+                    name: Some("sharded".into()),
+                    column: "id".into(),
+                    kind: pgdog_config::TableKind::Hybrid,
+                    ..Default::default()
+                },
+            ],
+            vec![],
+            false,
+            pgdog_config::SystemCatalogsBehavior::default(),
+        );
+
+        let stmt = pg_raw_parse::parse("UPDATE sharded SET id = $1 WHERE email = $2").unwrap();
+        let db_schema = default_db_schema();
+        let mut stmts = PreparedStatements::new();
+        let ctx = StatementRewriteContext {
+            schema: &schema,
+            db_schema: &db_schema,
+            extended: true,
+            prepared: false,
+            prepared_statements: &mut stmts,
+            user: "",
+            search_path: None,
+        };
+        let mut plan = RewritePlan::default();
+        StatementRewrite::new(ctx)
+            .sharding_key_update(
+                match stmt.stmts().next().unwrap() {
+                    Node::UpdateStmt(stmt) => stmt,
+                    _ => panic!("Not an update"),
+                },
+                &mut plan,
+            )
+            .unwrap();
+        assert!(plan.sharding_key_update.is_none());
     }
 
     #[test]

@@ -23,6 +23,7 @@ impl QueryParser {
         let pending_lookups = parser.take_pending_lookups();
         context.pending_lookups.extend(pending_lookups);
         let omnisharded = !is_sharded && shard.is_none();
+        let hybrid = is_sharded && parser.references_hybrid_table();
 
         if let Some(shard) = shard {
             if let Some(recorder) = self.recorder_mut() {
@@ -50,7 +51,9 @@ impl QueryParser {
         }
 
         Ok(Command::Query(
-            Route::write(context.shards_calculator.shard()).with_omnisharded(omnisharded),
+            Route::write(context.shards_calculator.shard())
+                .with_omnisharded(omnisharded)
+                .with_hybrid_table(hybrid),
         ))
     }
 }
