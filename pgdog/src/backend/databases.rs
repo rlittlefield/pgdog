@@ -401,7 +401,6 @@ pub(crate) fn reclassify_pending(
 /// the caller owns it and must shut it down when done. Uses the
 /// database's `schema_admin` user's credentials, same as the serving
 /// shards.
-#[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
 pub(crate) fn provisioning_cluster(database: &str, shard: usize) -> Result<Cluster, Error> {
     let config = config();
     let general = &config.config.general;

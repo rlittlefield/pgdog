@@ -113,7 +113,7 @@ pub(crate) enum Error {
     ProvisioningLockLost,
 
     #[error(
-        "pgdog instance(s) [{0}] haven't registered on the new shard; deploy the config with the provisioning entry everywhere first"
+        "pgdog instance(s) [{0}] haven't registered on the new shard; deploy the config that declares the new shard everywhere first"
     )]
     #[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
     InstancesNotRegistered(String),
