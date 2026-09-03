@@ -169,6 +169,53 @@ pub(crate) enum Error {
     #[allow(dead_code)] // TODO: remove once the WAL key filter lands
     KeyMoveMissingKey { table: String, op: &'static str },
 
+    #[error("sharded {0} has no \"move_query\" to flip a key's placement with")]
+    KeyMoveNoMoveQuery(String),
+
+    #[error("another pgdog instance is already moving keys in this database")]
+    KeyMoveLocked,
+
+    #[error(
+        "the replica identity of {table} doesn't cover sharding column \"{column}\"; \
+         run ALTER TABLE {table} REPLICA IDENTITY FULL, or use an index that covers it"
+    )]
+    KeyMoveIdentityGap { table: String, column: String },
+
+    #[error(
+        "the target shard holds rows for the moving keys in {table}, \
+         likely from a crashed prior attempt; clean it first: {cleanup}"
+    )]
+    KeyMoveTargetDirty { table: String, cleanup: String },
+
+    #[error(
+        "key \"{key}\" resolves to shard {got}, but the other keys resolve to shard {expected}; move them separately"
+    )]
+    #[allow(dead_code)] // TODO: remove once the MOVE KEYS task lands
+    KeysSpanShards {
+        key: String,
+        expected: usize,
+        got: usize,
+    },
+
+    #[error("key \"{key}\" already lives on shard {shard}")]
+    #[allow(dead_code)] // TODO: remove once the MOVE KEYS task lands
+    KeyAlreadyOnTarget { key: String, shard: usize },
+
+    #[error("shard {target} doesn't exist: the database has {shards} shard(s)")]
+    #[allow(dead_code)] // TODO: remove once the MOVE KEYS task lands
+    KeyMoveTargetOutOfRange { target: usize, shards: usize },
+
+    #[error(
+        "table {table}'s column \"{column}\" is {actual}, but the sharding key type is \
+         {expected:?}; every table bearing the column must use the key's type"
+    )]
+    KeyMoveColumnType {
+        table: String,
+        column: String,
+        expected: pgdog_config::DataType,
+        actual: String,
+    },
+
     #[error("net: {0}")]
     Net(#[from] crate::net::Error),
 
