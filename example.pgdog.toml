@@ -457,6 +457,9 @@ database = "pgdog_sharded"
 name = "sharded_varchar"
 column = "id_varchar"
 data_type = "varchar"
+# Rows with a NULL sharding key exist on every shard: ADD SHARD copies
+# them to the new shard and pauses this table's writes at the cutover.
+# broadcast_null = true
 
 # [multi_tenant]
 # column = "tenant_id"

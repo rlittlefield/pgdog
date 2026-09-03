@@ -624,6 +624,7 @@ impl QueryParser {
         );
         let shard = parser.shard()?;
         let omnisharded = !is_sharded && shard.is_none();
+        let broadcast_null = is_sharded && parser.references_broadcast_null_table();
         let shard = shard.unwrap_or(Shard::All);
         let pending_lookups = parser.take_pending_lookups();
         context.pending_lookups.extend(pending_lookups);
@@ -649,7 +650,9 @@ impl QueryParser {
         }
 
         Ok(Command::Query(
-            Route::write(shard).with_omnisharded(omnisharded),
+            Route::write(shard)
+                .with_omnisharded(omnisharded)
+                .with_broadcast_null_table(broadcast_null),
         ))
     }
 }
