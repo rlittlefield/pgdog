@@ -394,6 +394,21 @@ pub(crate) fn reclassify_pending(
     Ok(true)
 }
 
+/// Drop cached sharding key lookup translations for these values in
+/// every cluster serving the database. Clusters are per (user,
+/// database) pair, each with its own cache, so one database can have
+/// several. The next statement using one of the keys re-runs its
+/// lookup query and reads the current placement.
+// Consumed by the MOVE KEYS cutover.
+#[allow(dead_code)]
+pub(crate) fn invalidate_lookup_keys(database: &str, keys: &[String]) {
+    for (user, cluster) in databases().all() {
+        if user.database == database {
+            cluster.invalidate_lookup_keys(keys);
+        }
+    }
+}
+
 /// Build a launched, non-serving one-shard `Cluster` for a shard being
 /// provisioned by `ADD SHARD`, from its pending config entry.
 /// Several future shards can be declared at once; `shard` names the
