@@ -85,7 +85,6 @@ impl Orchestrator {
     /// Create an orchestrator for ADD SHARD: the source is a config
     /// database (scoped to one shard), the destination is a caller-owned
     /// provisioning cluster that no reload can re-resolve.
-    #[allow(dead_code)] // TODO: remove once the ADD SHARD run loop lands
     pub(crate) fn for_provisioning(
         source: &str,
         destination: Cluster,
@@ -113,14 +112,12 @@ impl Orchestrator {
     /// Dump and restore schema without a publication. For databases
     /// with no omnisharded tables there is nothing to copy or stream:
     /// ADD SHARD only provisions DDL.
-    #[allow(dead_code)] // TODO: remove once the ADD SHARD run loop lands
     pub(crate) fn schema_only(mut self) -> Self {
         self.schema_only = true;
         self
     }
 
     /// Restrict the replication source to a single shard.
-    #[allow(dead_code)] // TODO: remove once the ADD SHARD run loop lands
     pub(crate) fn with_source_shard(mut self, shard: usize) -> Result<Self, Error> {
         self.source_shard = Some(shard);
         self.source = self.source.shard_view(shard)?;
