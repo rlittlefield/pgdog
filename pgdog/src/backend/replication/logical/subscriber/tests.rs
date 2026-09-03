@@ -78,6 +78,7 @@ fn make_sharded_table() -> Table {
             },
         ],
         lsn: Lsn::default(),
+        null_filter_column: None,
     }
 }
 
@@ -111,6 +112,7 @@ fn make_sharded_test_b_table() -> Table {
             },
         ],
         lsn: Lsn::default(),
+        null_filter_column: None,
     }
 }
 
@@ -903,6 +905,7 @@ fn make_posts_table() -> Table {
             },
         ],
         lsn: Lsn::default(),
+        null_filter_column: None,
     }
 }
 
@@ -1278,6 +1281,7 @@ fn make_full_identity_sharded_table() -> Table {
             },
         ],
         lsn: Lsn::default(),
+        null_filter_column: None,
     }
 }
 
@@ -1320,6 +1324,7 @@ fn make_full_identity_omni_table() -> Table {
             },
         ],
         lsn: Lsn::default(),
+        null_filter_column: None,
     }
 }
 
@@ -2250,6 +2255,7 @@ fn make_settings_table() -> Table {
             },
         ],
         lsn: Lsn::default(),
+        null_filter_column: None,
     }
 }
 
@@ -2410,4 +2416,273 @@ async fn cross_subscriber_omni_deadlock_two_databases() {
             cleanup(&mut pg1, "public.settings", &[&id1, &id2]).await;
         }
     }
+}
+
+// ── Hybrid (broadcast_null) table tests ─────────────────────────────
+
+/// Table with a nullable sharding key whose NULL rows replicate
+/// (`broadcast_null`): id BIGINT PK, org_id TEXT (the key), value TEXT.
+fn make_hybrid_table() -> Table {
+    Table {
+        publication: "test".to_string(),
+        table: PublicationTable {
+            schema: "public".to_string(),
+            name: "hybrid_null".to_string(),
+            attributes: "".to_string(),
+            parent_schema: "".to_string(),
+            parent_name: "".to_string(),
+        },
+        identity: ReplicaIdentity {
+            oid: Oid(3),
+            identity: "".to_string(),
+            kind: "".to_string(),
+        },
+        columns: vec![
+            PublicationTableColumn {
+                oid: 3,
+                name: "id".to_string(),
+                type_oid: Oid(20),
+                identity: true,
+            },
+            PublicationTableColumn {
+                oid: 3,
+                name: "org_id".to_string(),
+                type_oid: Oid(25),
+                identity: false,
+            },
+            PublicationTableColumn {
+                oid: 3,
+                name: "value".to_string(),
+                type_oid: Oid(25),
+                identity: false,
+            },
+        ],
+        lsn: Lsn::default(),
+        null_filter_column: Some("org_id".to_string()),
+    }
+}
+
+fn hybrid_relation(oid: Oid) -> Relation {
+    Relation {
+        oid,
+        namespace: "public".to_string(),
+        name: "hybrid_null".to_string(),
+        replica_identity: 100,
+        columns: vec![
+            RelColumn {
+                flag: 1,
+                name: "id".to_string(),
+                oid: Oid(20),
+                type_modifier: -1,
+            },
+            RelColumn {
+                flag: 0,
+                name: "org_id".to_string(),
+                oid: Oid(25),
+                type_modifier: -1,
+            },
+            RelColumn {
+                flag: 0,
+                name: "value".to_string(),
+                oid: Oid(25),
+                type_modifier: -1,
+            },
+        ],
+    }
+}
+
+fn hybrid_tuple(id: &str, org_id: Option<&str>, value: &str) -> TupleData {
+    TupleData {
+        columns: vec![
+            text_column(id),
+            org_id.map(text_column).unwrap_or_else(null_column),
+            text_column(value),
+        ],
+    }
+}
+
+fn hybrid_insert(oid: Oid, id: &str, org_id: Option<&str>, value: &str) -> CopyData {
+    xlog_copy_data(
+        XLogInsert {
+            oid,
+            tuple_data: hybrid_tuple(id, org_id, value),
+        }
+        .to_bytes(),
+    )
+}
+
+fn hybrid_update(oid: Oid, id: &str, org_id: Option<&str>, value: &str) -> CopyData {
+    x_update(XLogUpdate {
+        oid,
+        identity: UpdateIdentity::Nothing,
+        new: hybrid_tuple(id, org_id, value),
+    })
+}
+
+async fn hybrid_setup(verify: &mut Server, ids: &[&str]) {
+    verify
+        .execute(
+            "CREATE TABLE IF NOT EXISTS public.hybrid_null (\
+             id BIGINT PRIMARY KEY, org_id TEXT, value TEXT)",
+        )
+        .await
+        .unwrap();
+    for id in ids {
+        verify
+            .execute(format!("DELETE FROM public.hybrid_null WHERE id = {}", id))
+            .await
+            .unwrap();
+    }
+}
+
+fn make_hybrid_subscriber() -> StreamSubscriber {
+    let cluster = Cluster::new_test_single_shard(&config());
+    StreamSubscriber::new(&cluster, &[make_hybrid_table()], OmniOwnership::test())
+}
+
+/// Inserts of keyed rows are dropped; NULL-key rows apply.
+#[tokio::test]
+async fn hybrid_insert_filters_keyed_rows() {
+    let mut sub = make_hybrid_subscriber();
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16390);
+    let id_null = random_id();
+    let id_keyed = random_id();
+    hybrid_setup(&mut verify, &[&id_null, &id_keyed]).await;
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(xlog_copy_data(hybrid_relation(oid).to_bytes()))
+        .await
+        .unwrap();
+    sub.handle(hybrid_insert(oid, &id_null, None, "global"))
+        .await
+        .unwrap();
+    sub.handle(hybrid_insert(oid, &id_keyed, Some("org_a"), "tenant"))
+        .await
+        .unwrap();
+    let status = sub.handle(commit_copy_data(200)).await.unwrap();
+    assert!(status.is_some());
+
+    assert_eq!(
+        count_row(&mut verify, "public.hybrid_null", &id_null).await,
+        1
+    );
+    assert_eq!(
+        count_row(&mut verify, "public.hybrid_null", &id_keyed).await,
+        0
+    );
+
+    hybrid_setup(&mut verify, &[&id_null, &id_keyed]).await;
+}
+
+/// UPDATE transitions: NULL→NULL overwrites, NULL→value removes the row,
+/// value→NULL materialises it.
+#[tokio::test]
+async fn hybrid_update_transitions() {
+    let mut sub = make_hybrid_subscriber();
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16391);
+    let id = random_id();
+    let id_entering = random_id();
+    hybrid_setup(&mut verify, &[&id, &id_entering]).await;
+
+    // Seed a NULL-key row.
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(xlog_copy_data(hybrid_relation(oid).to_bytes()))
+        .await
+        .unwrap();
+    sub.handle(hybrid_insert(oid, &id, None, "v1"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+
+    // NULL→NULL: overwrites in place.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    sub.handle(hybrid_update(oid, &id, None, "v2"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(400)).await.unwrap();
+    assert_eq!(
+        fetch_value(&mut verify, "public.hybrid_null", &id).await,
+        Some("v2".to_string())
+    );
+
+    // value→NULL on a row the destination never had (it was keyed):
+    // the upsert materialises it.
+    sub.handle(begin_copy_data(500)).await.unwrap();
+    sub.handle(hybrid_update(oid, &id_entering, None, "entered"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(600)).await.unwrap();
+    assert_eq!(
+        fetch_value(&mut verify, "public.hybrid_null", &id_entering).await,
+        Some("entered".to_string())
+    );
+
+    // NULL→value: the row leaves the broadcast set — removed.
+    sub.handle(begin_copy_data(700)).await.unwrap();
+    sub.handle(hybrid_update(oid, &id, Some("org_a"), "v3"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(800)).await.unwrap();
+    assert_eq!(count_row(&mut verify, "public.hybrid_null", &id).await, 0);
+
+    hybrid_setup(&mut verify, &[&id, &id_entering]).await;
+}
+
+/// DELETEs apply unconditionally: keyed-row deletes no-op silently,
+/// NULL-row deletes remove the row; the watermark advances either way.
+#[tokio::test]
+async fn hybrid_delete_applies_unconditionally() {
+    let mut sub = make_hybrid_subscriber();
+    let mut verify = test_server().await;
+    sub.connect().await.unwrap();
+
+    let oid = Oid(16392);
+    let id_null = random_id();
+    let id_keyed = random_id();
+    hybrid_setup(&mut verify, &[&id_null, &id_keyed]).await;
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(xlog_copy_data(hybrid_relation(oid).to_bytes()))
+        .await
+        .unwrap();
+    sub.handle(hybrid_insert(oid, &id_null, None, "global"))
+        .await
+        .unwrap();
+    sub.handle(commit_copy_data(200)).await.unwrap();
+
+    // Delete of a keyed row that never landed here: silent no-op.
+    // Delete of the NULL row: removed. The key tuple carries the
+    // identity column only, like the WAL 'K' shape.
+    sub.handle(begin_copy_data(300)).await.unwrap();
+    for id in [&id_keyed, &id_null] {
+        sub.handle(xlog_copy_data(
+            XLogDelete {
+                oid,
+                key: Some(TupleData {
+                    columns: vec![text_column(id), null_column(), null_column()],
+                }),
+                old: None,
+            }
+            .to_bytes(),
+        ))
+        .await
+        .unwrap();
+    }
+    let status = sub.handle(commit_copy_data(400)).await.unwrap();
+    assert!(status.is_some());
+
+    assert_eq!(
+        count_row(&mut verify, "public.hybrid_null", &id_null).await,
+        0
+    );
+    assert_eq!(
+        count_row(&mut verify, "public.hybrid_null", &id_keyed).await,
+        0
+    );
 }

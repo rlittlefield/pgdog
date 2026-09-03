@@ -37,6 +37,9 @@ pub(crate) struct Table {
     pub(crate) columns: Vec<PublicationTableColumn>,
     /// Table data as of this LSN.
     pub(crate) lsn: Lsn,
+    /// Only rows with this column NULL are copied and replicated
+    /// (`broadcast_null` tables during ADD SHARD).
+    pub(crate) null_filter_column: Option<String>,
 }
 
 /// An enumerated view over a subset of a table's columns.
@@ -152,6 +155,7 @@ impl Table {
                 identity,
                 columns,
                 lsn: Lsn::default(),
+                null_filter_column: None,
             });
         }
 
@@ -552,6 +556,7 @@ mod test {
                 })
                 .collect(),
             lsn: Lsn::default(),
+            null_filter_column: None,
         }
     }
 
@@ -867,6 +872,7 @@ mod test {
             identity,
             columns,
             lsn: Lsn::default(),
+            null_filter_column: None,
         }
     }
 

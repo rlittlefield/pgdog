@@ -123,6 +123,7 @@ mod test {
                 })
                 .collect(),
             lsn: Lsn::default(),
+            null_filter_column: None,
         }
     }
 
