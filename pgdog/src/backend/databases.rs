@@ -29,7 +29,7 @@ use crate::frontend::router::parser::Cache;
 use crate::frontend::router::sharding::{LookupCache, Mapping, ShardedTable};
 use crate::{
     backend::pool::PoolConfig,
-    config::{ConfigAndUsers, ShardedMappingDeprecated, User as ConfigUser, config, load, set},
+    config::{ConfigAndUsers, ShardedMappingDeprecated, User as ConfigUser, config, set},
     net::{messages::FrontendPid, tls},
 };
 
@@ -137,9 +137,13 @@ pub(crate) async fn cancel_all(database: &str) -> Result<(), Error> {
 pub(crate) fn reload() -> Result<(), Error> {
     info!("reloading configuration");
 
-    // Load config from disk.
+    // Load config from disk. New trailing shard entries are gated on
+    // the running config's serving boundary until a marker read
+    // confirms them.
     let old_config = config();
-    let new_config = load(&old_config.config_path, &old_config.users_path)?;
+    let mut new_config = ConfigAndUsers::load(&old_config.config_path, &old_config.users_path)?;
+    crate::backend::provisioning::carry_over(&mut new_config, &old_config);
+    let new_config = set(new_config)?;
     let databases = from_config(&new_config);
 
     // Replace databases.
@@ -155,6 +159,10 @@ pub(crate) fn reload() -> Result<(), Error> {
 
     // Resize query cache.
     Cache::resize(new_config.config.general.query_cache_limit);
+
+    // Check pending shards against the cluster's markers in the
+    // background and activate the confirmed ones.
+    crate::backend::provisioning::on_config_change();
 
     Ok(())
 }
@@ -279,6 +287,111 @@ pub(crate) async fn cutover(source: &str, destination: &str) -> Result<(), Error
     }
 
     Ok(())
+}
+
+/// Build a launched, non-serving one-shard `Cluster` on shard 0 of a
+/// serving database: the arbiter pgdog asks when the config alone
+/// can't answer, starting with the `pgdog.config` marker that gates
+/// pending shards. The caller owns it and must shut it down when done:
+/// handing out the serving cluster would kill live pools on its
+/// shutdown. Uses the database's `schema_admin` user's credentials.
+pub(crate) fn shard_zero_cluster(database: &str) -> Result<Cluster, Error> {
+    let config = config();
+    let general = &config.config.general;
+
+    let user = config
+        .users
+        .users
+        .iter()
+        .find(|user| user.database == database && user.schema_admin)
+        .ok_or(Error::NoSchemaAdmin(database.to_string()))?;
+
+    let (number, entry) = config
+        .config
+        .databases
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| {
+            !entry.provisioning
+                && entry.name == database
+                && entry.shard == 0
+                && entry.role == pgdog_config::Role::Primary
+        })
+        .ok_or_else(|| Error::NoShardZeroPrimary(database.to_string()))?;
+
+    let enumerated = EnumeratedDatabase {
+        number,
+        database: entry.clone(),
+    };
+    let nodes = [enumerated];
+    let shard_nodes = pgdog_config::pool::ShardNodes::new(&nodes);
+    let primary = PoolConfig {
+        address: Address::new(entry, user, number),
+        config: pgdog_config::pool::PoolConfig::resolve(general, &shard_nodes, entry, user),
+    };
+    let shard_configs = vec![ClusterShardConfig {
+        primary: Some(primary),
+        replicas: vec![],
+    }];
+
+    let query_parser = QueryParser {
+        database: database.to_string(),
+        level: general.query_parser,
+        engine: general.query_parser_engine,
+    };
+
+    let cluster_config = ClusterConfig::new(
+        &config.config,
+        user,
+        &shard_configs,
+        ShardedTables::default(),
+        ShardedSchemas::default(),
+        query_parser,
+        SchemaCache::default(),
+    );
+
+    let cluster = Cluster::new(cluster_config);
+    cluster.launch();
+
+    Ok(cluster)
+}
+
+/// Set the pending boundary for a database: entries at `serving` and
+/// above are pending, the rest serve. Validates and (optionally)
+/// rebuilds the databases registry under the config lock — startup
+/// classification runs before the registry exists and skips the
+/// rebuild. Returns whether anything changed.
+pub(crate) fn reclassify_pending(
+    database: &str,
+    serving: usize,
+    rebuild: bool,
+) -> Result<bool, Error> {
+    let _lock = lock();
+
+    let mut config = config().deref().clone();
+    let mut changed = false;
+    for entry in config
+        .config
+        .databases
+        .iter_mut()
+        .filter(|entry| entry.name == database)
+    {
+        let pending = entry.shard >= serving;
+        if entry.provisioning != pending {
+            entry.provisioning = pending;
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+
+    set(config.clone())?;
+    if rebuild {
+        replace_databases(from_config(&config), true)?;
+    }
+
+    Ok(true)
 }
 
 /// Build a launched, non-serving one-shard `Cluster` for a shard being

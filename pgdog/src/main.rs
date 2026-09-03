@@ -159,6 +159,10 @@ async fn pgdog(command: Option<Commands>) -> Result<(), Box<dyn std::error::Erro
     // are async, so doing this after Tokio launched seems prudent.
     net::tls::load()?;
 
+    // Which declared shards serve is the cluster's call: ask shard 0's
+    // pgdog.config marker before the registry is built from the config.
+    backend::provisioning::classify_at_startup().await;
+
     // Load databases and connect if needed.
     databases::init()?;
 

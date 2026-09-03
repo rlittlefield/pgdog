@@ -24,6 +24,9 @@ pub(crate) enum Error {
     #[error("no schema_admin user configured for database \"{0}\"")]
     NoSchemaAdmin(String),
 
+    #[error("no primary entry for shard 0 of database \"{0}\"")]
+    NoShardZeroPrimary(String),
+
     #[error("no pending shard entry for {0}")]
     NoProvisioningShard(String),
 
