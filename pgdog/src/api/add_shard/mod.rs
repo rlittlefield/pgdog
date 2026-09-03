@@ -18,35 +18,24 @@
 //! data, catch-up), [`cutover`] (park, drain, swap, finalize), and
 //! [`schema_only`] (the degenerate path without omnisharded tables).
 
+mod cutover;
 mod guards;
+mod provision;
 
-/// Stages of adding a shard, reported as the task's status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
-pub(crate) enum AddShardStatus {
-    /// Checking that the cluster can grow in place.
-    #[display("validating")]
-    Validating,
-    /// Running the pre-data schema-sync child task.
-    #[display("syncing schema")]
-    SchemaSync,
-    /// Running the data-copy child task.
-    #[display("syncing data")]
-    SyncingData,
-    /// Running the post-data schema-sync child task.
-    #[display("finalizing schema")]
-    FinalizingSchema,
-    /// Streaming changes to catch the new shard up.
-    #[display("replicating")]
-    Replicating,
-    /// Caught up; waiting for an operator `CUTOVER`.
-    #[display("awaiting cutover")]
-    AwaitingCutover,
-    /// Omni writes paused; draining replication to zero.
-    #[display("draining")]
-    Draining,
-    /// Swapping the new shard into the topology.
-    #[display("swapping topology")]
-    SwappingTopology,
+use std::time::Duration;
+
+use crate::api::task::TaskContext;
+use crate::api::{MigrationError, Task};
+use pgdog_stats::{AddShardStatus, TaskDefinition};
+
+/// Outcome of a cutover attempt.
+enum CutoverOutcome {
+    /// The shard is in the topology.
+    Done,
+    /// The cutover was called off (drain timeout, or the fleet wasn't
+    /// ready): every barrier was released and replication continues;
+    /// the task goes back to waiting for a cutover.
+    Aborted,
 }
 
 /// Add a new shard to a database: provision the shard declared with
@@ -67,4 +56,24 @@ pub(crate) struct AddShardTask {
     /// instead of waiting for an operator `CUTOVER`.
     #[builder(default)]
     pub auto_cutover: bool,
+}
+
+impl Task for AddShardTask {
+    type Status = AddShardStatus;
+    type Output = ();
+    type Error = MigrationError;
+
+    fn cancel_timeout() -> Duration {
+        Duration::from_secs(60)
+    }
+
+    fn definition(&self) -> impl Into<TaskDefinition> {
+        "add_shard"
+    }
+
+    // Nothing constructs this task yet: the full run loop lands with
+    // the schema-only path and the ADD SHARD admin command.
+    async fn run(self, _ctx: TaskContext<Self>) -> Result<(), MigrationError> {
+        unimplemented!("ADD SHARD run loop lands with the schema-only path")
+    }
 }
