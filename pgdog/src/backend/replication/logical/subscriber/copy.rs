@@ -37,6 +37,12 @@ pub(crate) struct CopySubscriber {
     connections: Vec<ParallelConnection>,
     stmt: CopyStatement,
     bytes_sharded: usize,
+    /// Forward every row to this shard verbatim instead of sharding
+    /// per row. MOVE KEYS copies rows that belong on one shard by
+    /// construction (the source filters them), and routing them would
+    /// bounce them back to the source: the placement doesn't flip
+    /// until the cutover.
+    fixed_shard: Option<usize>,
 }
 
 impl CopySubscriber {
@@ -68,13 +74,28 @@ impl CopySubscriber {
             connections: vec![],
             stmt: copy_stmt.clone(),
             bytes_sharded: 0,
+            fixed_shard: None,
         })
     }
 
-    /// Connect to all shards. One connection per primary.
+    /// Forward every row to one shard verbatim, skipping per-row
+    /// sharding. Only that shard is connected.
+    // Consumed by the MOVE KEYS copy.
+    #[allow(dead_code)]
+    pub(crate) fn set_fixed_shard(&mut self, shard: usize) {
+        self.fixed_shard = Some(shard);
+    }
+
+    /// Connect to all shards, one connection per primary; with a fixed
+    /// shard, only to it.
     pub(crate) async fn connect(&mut self) -> Result<(), Error> {
         let mut servers = vec![];
-        for shard in self.cluster.shards() {
+        for (number, shard) in self.cluster.shards().iter().enumerate() {
+            if let Some(fixed) = self.fixed_shard
+                && number != fixed
+            {
+                continue;
+            }
             let primary = shard
                 .pools_with_roles()
                 .iter()
@@ -227,7 +248,10 @@ impl CopySubscriber {
         // scope). Shards not yet committed roll back on connection close. The
         // destination_has_rows() guard in parallel_sync.rs prevents a doomed retry if this
         // window is ever hit.
-        if self.cluster.two_pc_enabled() {
+        // With a fixed shard there's exactly one connection: a plain
+        // COMMIT is atomic, and the 2PC identifiers are keyed by shard
+        // index, which a single-connection subscriber doesn't have.
+        if self.cluster.two_pc_enabled() && self.fixed_shard.is_none() {
             self.commit_two_pc().await?;
         } else {
             for (shard, server) in self.connections.iter_mut().enumerate() {
@@ -310,6 +334,20 @@ impl CopySubscriber {
     }
 
     async fn flush(&mut self) -> Result<(usize, usize), Error> {
+        // A fixed shard takes the rows verbatim: the source already
+        // filtered them, and per-row routing would send them back to
+        // the source (the placement flips at cutover, after the copy).
+        if self.fixed_shard.is_some() {
+            let rows = self.buffer.len();
+            let bytes = self.buffer.iter().map(|data| data.len()).sum::<usize>();
+            let server = self.connections.first_mut().ok_or(Error::NoPrimary)?;
+            for data in std::mem::take(&mut self.buffer) {
+                server.send_one(&data.into()).await?;
+            }
+            self.bytes_sharded += bytes;
+            return Ok((rows, bytes));
+        }
+
         let result = self.copy.shard(&self.buffer).await?;
         self.buffer.clear();
 

@@ -14,6 +14,20 @@ use tracing::warn;
 
 use crate::net::Parameters; // 0.8
 
+/// Quote a string as a SQL literal, like Postgres's `quote_literal`:
+/// quotes are doubled, and a value containing backslashes becomes an
+/// `E''` string with the backslashes doubled, so the result is safe to
+/// interpolate regardless of `standard_conforming_strings`. For
+/// statements that can bind parameters, prefer binding; this is for
+/// the ones that can't, e.g. `COPY (SELECT ...)`.
+pub(crate) fn quote_literal(s: &str) -> String {
+    if s.contains('\\') {
+        format!("E'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+}
+
 pub(crate) fn format_time(time: DateTime<Local>) -> String {
     time.format("%Y-%m-%d %H:%M:%S%.3f %Z").to_string()
 }
@@ -663,6 +677,20 @@ mod test {
         assert_eq!(truncate_utf8(s, 5), "é€"); // exact: end of €
         assert_eq!(truncate_utf8(s, 6), "é€"); // 1 byte into 𝄞 → walk back
         assert_eq!(truncate_utf8(s, 9), "é€𝄞"); // exact: end of 𝄞
+    }
+
+    #[test]
+    fn test_quote_literal() {
+        assert_eq!(quote_literal("11"), "'11'");
+        assert_eq!(quote_literal("Acme Corp"), "'Acme Corp'");
+        // Quotes double.
+        assert_eq!(quote_literal("O'Brien"), "'O''Brien'");
+        // Dollar signs have no meaning inside quotes.
+        assert_eq!(quote_literal("a$b$c"), "'a$b$c'");
+        // Backslashes force an E'' string, deterministic regardless of
+        // standard_conforming_strings.
+        assert_eq!(quote_literal(r"back\slash"), r"E'back\\slash'");
+        assert_eq!(quote_literal(r"both'\"), r"E'both''\\'");
     }
 
     #[test]
