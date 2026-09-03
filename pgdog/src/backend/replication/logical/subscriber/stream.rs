@@ -6,6 +6,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    sync::Arc,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -14,6 +15,7 @@ use once_cell::sync::Lazy;
 use pgdog_postgres_types::Oid;
 use tracing::{debug, trace, warn};
 
+use super::super::move_keys::KeyMoveScope;
 use super::super::publisher::{NonIdentityColumnsPresence, tables_missing_unique_index};
 use super::super::{
     Error, TableValidationError, TableValidationErrorKind, ensure_validation, publisher::Table,
@@ -29,8 +31,10 @@ use crate::{
     backend::{Cluster, ConnectReason, Server},
     config::Role,
     frontend::router::parser::Shard,
+    frontend::router::sharding::Value as ShardingValue,
     net::{
         Bind, CopyData, ErrorResponse, FromBytes, Parse, Protocol, Sync, ToBytes,
+        bind::Format,
         replication::{
             Commit as XLogCommit, Delete as XLogDelete, Insert as XLogInsert, Relation,
             StatusUpdate, UpdateIdentity, xlog_data::XLogPayload,
@@ -163,6 +167,99 @@ pub(crate) struct StreamSubscriber {
 
     // Determines which destination shards this subscriber owns for omni tables.
     partition: OmniOwnership,
+
+    // Apply only changes for the moving sharding keys, straight to the
+    // target shard (MOVE KEYS). Everything else advances the watermark
+    // and is dropped.
+    key_move: Option<KeyMoveFilter>,
+}
+
+/// Filters replicated changes to the moving keys and forces their
+/// destination: until the cutover flips the placement, the router
+/// would send every row back to the source shard.
+#[derive(Debug)]
+pub(crate) struct KeyMoveFilter {
+    scope: Arc<KeyMoveScope>,
+    // Sharding column position per relation OID, registered with each
+    // Relation message.
+    columns: HashMap<Oid, usize>,
+}
+
+/// What to do with one replicated change.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum KeyMoveDecision {
+    /// The change belongs to a moving key: apply it on the target.
+    Move,
+    /// It doesn't: drop it, advancing the watermark.
+    Skip,
+}
+
+impl KeyMoveFilter {
+    /// Match a relation against the scope's tables and remember its
+    /// sharding column position. A relation outside the scope is a
+    /// bug: the MOVE KEYS publication covers exactly the scope.
+    fn register(&mut self, relation: &Relation) {
+        let table = self
+            .scope
+            .tables()
+            .iter()
+            .find(|table| table.schema == relation.namespace && table.name == relation.name);
+        if let Some(table) = table
+            && let Some(position) = relation
+                .columns
+                .iter()
+                .position(|column| column.name == table.sharding_column)
+        {
+            self.columns.insert(relation.oid, position);
+        }
+    }
+
+    /// Decide what to do with a change based on the sharding key in
+    /// its tuple. Every tuple this sees carries the key: identity
+    /// tuples do because the preflight guard requires the replica
+    /// identity to cover the sharding column, and full tuples always
+    /// do. A missing or unreadable key fails the task rather than
+    /// silently dropping (which could lose a moved row) or applying
+    /// broadly (which could duplicate one).
+    fn decide(
+        &self,
+        oid: Oid,
+        tuple: &TupleData,
+        table: impl Fn() -> String,
+        op: &'static str,
+    ) -> Result<KeyMoveDecision, Error> {
+        let missing = || Error::KeyMoveMissingKey { table: table(), op };
+
+        let position = *self.columns.get(&oid).ok_or_else(missing)?;
+        let column = tuple.columns.get(position).ok_or_else(missing)?;
+        let value = match &column.identifier {
+            Identifier::Format(Format::Text) => {
+                let text = std::str::from_utf8(&column.data[..])
+                    .ok()
+                    .ok_or_else(missing)?;
+                self.scope.canonical(text)?
+            }
+            Identifier::Format(Format::Binary) => {
+                let value = ShardingValue::new(&column.data[..], self.scope.data_type());
+                match value.to_text() {
+                    Ok(Some(text)) => text.into_owned(),
+                    _ => return Err(missing()),
+                }
+            }
+            Identifier::Null | Identifier::Toasted => return Err(missing()),
+        };
+
+        Ok(if self.scope.contains(&value) {
+            KeyMoveDecision::Move
+        } else {
+            KeyMoveDecision::Skip
+        })
+    }
+
+    /// Where moving rows go.
+    fn target(&self) -> Shard {
+        Shard::Direct(self.scope.target())
+    }
 }
 
 impl StreamSubscriber {
@@ -194,7 +291,19 @@ impl StreamSubscriber {
             in_transaction: false,
             keys: HashMap::default(),
             partition,
+            key_move: None,
         }
+    }
+
+    /// Apply only changes for the moving keys, straight to the target
+    /// shard (MOVE KEYS).
+    // Consumed by the MOVE KEYS orchestrator mode.
+    #[allow(dead_code)]
+    pub(crate) fn set_key_move(&mut self, scope: Arc<KeyMoveScope>) {
+        self.key_move = Some(KeyMoveFilter {
+            scope,
+            columns: HashMap::new(),
+        });
     }
 
     // Connect to all the shards.
@@ -334,6 +443,27 @@ impl StreamSubscriber {
             .is_some_and(|statements| statements.null_column_idx.is_some())
     }
 
+    /// Decide what the key-move filter does with a change. `None`
+    /// means no filter is set: route normally.
+    fn key_move_decision(
+        &self,
+        oid: Oid,
+        tuple: &TupleData,
+        op: &'static str,
+    ) -> Result<Option<(KeyMoveDecision, Shard)>, Error> {
+        let Some(filter) = &self.key_move else {
+            return Ok(None);
+        };
+        let table = || {
+            self.relations
+                .get(&oid)
+                .map(|relation| format!("\"{}\".\"{}\"", relation.namespace, relation.name))
+                .unwrap_or_else(|| format!("relation {}", oid.0))
+        };
+        let decision = filter.decide(oid, tuple, table, op)?;
+        Ok(Some((decision, filter.target())))
+    }
+
     // Handle Insert message.
     //
     // Convert Insert into an idempotent "upsert" and apply it to
@@ -354,11 +484,19 @@ impl StreamSubscriber {
                 statements.upsert.parse()
             } else {
                 statements.insert.parse()
-            };
-            let ctx = StreamContext::new(&self.cluster, &insert.tuple_data, parse).await?;
-            {
-                let (shard, bind) = ctx.into_parts();
-                self.send(&shard, bind, true).await?;
+            }
+            .clone();
+            match self.key_move_decision(insert.oid, &insert.tuple_data, "INSERT")? {
+                Some((KeyMoveDecision::Skip, _)) => {}
+                Some((KeyMoveDecision::Move, target)) => {
+                    let bind = insert.tuple_data.to_bind(parse.name());
+                    self.send(&target, bind, true).await?;
+                }
+                None => {
+                    let ctx = StreamContext::new(&self.cluster, &insert.tuple_data, &parse).await?;
+                    let (shard, bind) = ctx.into_parts();
+                    self.send(&shard, bind, true).await?;
+                }
             }
         }
 
@@ -507,10 +645,17 @@ impl StreamSubscriber {
             .update
             .parse()
             .clone();
-        let ctx = StreamContext::new(&self.cluster, new, &parse).await?;
-        {
-            let (shard, bind) = ctx.into_parts();
-            self.send(&shard, bind, true).await?;
+        match self.key_move_decision(oid, new, "UPDATE")? {
+            Some((KeyMoveDecision::Skip, _)) => {}
+            Some((KeyMoveDecision::Move, target)) => {
+                let bind = new.to_bind(parse.name());
+                self.send(&target, bind, true).await?;
+            }
+            None => {
+                let ctx = StreamContext::new(&self.cluster, new, &parse).await?;
+                let (shard, bind) = ctx.into_parts();
+                self.send(&shard, bind, true).await?;
+            }
         }
         self.mark_table_changed(oid);
         Ok(())
@@ -530,14 +675,30 @@ impl StreamSubscriber {
             return Ok(());
         }
 
+        // Decide before building the partial: the sharding key column
+        // is in the replica identity (preflight guard), so it's never
+        // toasted here.
+        let key_move = self.key_move_decision(oid, &update.new, "UPDATE")?;
+        if let Some((KeyMoveDecision::Skip, _)) = key_move {
+            self.mark_table_changed(oid);
+            return Ok(());
+        }
+
         let partial_new = update.partial_new();
         let shape_stmt = self
             .ensure_update_shape_for(oid, &table, &present, false)
             .await?;
-        let ctx = StreamContext::new(&self.cluster, &partial_new, shape_stmt.parse()).await?;
-        {
-            let (shard, bind) = ctx.into_parts();
-            self.send(&shard, bind, true).await?;
+        match key_move {
+            Some((KeyMoveDecision::Move, target)) => {
+                let bind = partial_new.to_bind(shape_stmt.parse().name());
+                self.send(&target, bind, true).await?;
+            }
+            _ => {
+                let ctx =
+                    StreamContext::new(&self.cluster, &partial_new, shape_stmt.parse()).await?;
+                let (shard, bind) = ctx.into_parts();
+                self.send(&shard, bind, true).await?;
+            }
         }
         self.mark_table_changed(oid);
         Ok(())
@@ -667,8 +828,51 @@ impl StreamSubscriber {
         // update.new carry the same value as the corresponding column in old_full.
         // Routing from a raw 'u' column yields empty bytes → wrong shard.
         let complete_new = update.new.fill_toasted_from(old_full)?;
-        let new_shard = self.shard_for(&complete_new, &update_parse).await?;
-        let old_shard = self.shard_for(old_full, &update_parse).await?;
+
+        // The key-move filter judges the halves independently: an
+        // UPDATE can change the sharding key itself, moving the row
+        // into or out of the moving set.
+        let key_move = match (
+            self.key_move_decision(oid, old_full, "UPDATE")?,
+            self.key_move_decision(oid, &complete_new, "UPDATE")?,
+        ) {
+            (Some(old), Some(new)) => Some((old, new)),
+            _ => None,
+        };
+        let (new_shard, old_shard) =
+            if let Some(((old_decision, target), (new_decision, _))) = key_move {
+                match (old_decision, new_decision) {
+                    (KeyMoveDecision::Skip, KeyMoveDecision::Skip) => {
+                        self.mark_table_changed(oid);
+                        return Ok(());
+                    }
+                    // The row left the moving set: its old version is on
+                    // the target (copied or streamed); delete it there.
+                    // The new version belongs to a tenant staying on the
+                    // source.
+                    (KeyMoveDecision::Move, KeyMoveDecision::Skip) => {
+                        let delete_bind = old_full.to_bind(delete_parse.name());
+                        self.send(&target, delete_bind, true).await?;
+                        self.mark_table_changed(oid);
+                        return Ok(());
+                    }
+                    // The row joined the moving set: insert the new
+                    // version on the target; the old one never lived
+                    // there.
+                    (KeyMoveDecision::Skip, KeyMoveDecision::Move) => {
+                        let insert_bind = complete_new.to_bind(insert_parse.name());
+                        self.send(&target, insert_bind, true).await?;
+                        self.mark_table_changed(oid);
+                        return Ok(());
+                    }
+                    (KeyMoveDecision::Move, KeyMoveDecision::Move) => (target.clone(), target),
+                }
+            } else {
+                (
+                    self.shard_for(&complete_new, &update_parse).await?,
+                    self.shard_for(old_full, &update_parse).await?,
+                )
+            };
 
         if new_shard != old_shard {
             // Shard key changed: DELETE on old shard, INSERT on new shard.
@@ -745,7 +949,14 @@ impl StreamSubscriber {
             key
         };
 
-        let shard = self.shard_for(&tuple, &delete_parse).await?;
+        let shard = match self.key_move_decision(oid, &tuple, "DELETE")? {
+            Some((KeyMoveDecision::Skip, _)) => {
+                self.mark_table_changed(oid);
+                return Ok(());
+            }
+            Some((KeyMoveDecision::Move, target)) => target,
+            None => self.shard_for(&tuple, &delete_parse).await?,
+        };
         let bind = tuple.to_bind(delete_parse.name());
 
         // Hybrid (broadcast_null) tables apply every DELETE: keyed rows
@@ -937,6 +1148,9 @@ impl StreamSubscriber {
 
             // Only record tables we expect to stream changes for.
             self.table_lsns.insert(relation.oid, table.lsn.lsn);
+            if let Some(filter) = &mut self.key_move {
+                filter.register(&relation);
+            }
             self.relations.insert(relation.oid, relation);
         }
 
@@ -1168,6 +1382,125 @@ mod tests {
     fn make_subscriber() -> StreamSubscriber {
         let cluster = Cluster::new_test(&config());
         StreamSubscriber::new(&cluster, &[], OmniOwnership::test())
+    }
+
+    mod key_move {
+        use super::super::*;
+        use crate::backend::replication::logical::move_keys::{KeyMoveScope, MoveTable};
+        use crate::net::messages::replication::logical::tuple_data::{
+            binary_col, text_col, toasted_col,
+        };
+        use pgdog_config::DataType;
+
+        fn filter(data_type: DataType, keys: &[&str]) -> KeyMoveFilter {
+            let keys = keys.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+            let scope = KeyMoveScope::new(
+                &keys,
+                0,
+                2,
+                vec![MoveTable {
+                    schema: "public".into(),
+                    name: "orders".into(),
+                    sharding_column: "tenant_id".into(),
+                    data_type,
+                }],
+            )
+            .unwrap();
+            let mut filter = KeyMoveFilter {
+                scope: Arc::new(scope),
+                columns: HashMap::new(),
+            };
+            filter.register(&Relation {
+                oid: Oid(42),
+                namespace: "public".into(),
+                name: "orders".into(),
+                replica_identity: 0,
+                columns: vec![
+                    crate::net::messages::replication::logical::relation::Column {
+                        flag: 0,
+                        name: "id".into(),
+                        oid: Oid(20),
+                        type_modifier: 0,
+                    },
+                    crate::net::messages::replication::logical::relation::Column {
+                        flag: 0,
+                        name: "tenant_id".into(),
+                        oid: Oid(20),
+                        type_modifier: 0,
+                    },
+                ],
+            });
+            filter
+        }
+
+        fn table_name() -> impl Fn() -> String {
+            || "\"public\".\"orders\"".to_string()
+        }
+
+        #[test]
+        fn decide_by_text_key() {
+            let filter = filter(DataType::Bigint, &["11", "12"]);
+
+            let moving = TupleData {
+                columns: vec![text_col("5"), text_col("11")],
+            };
+            assert_eq!(
+                filter
+                    .decide(Oid(42), &moving, table_name(), "INSERT")
+                    .unwrap(),
+                KeyMoveDecision::Move
+            );
+            assert_eq!(filter.target(), Shard::Direct(2));
+
+            let staying = TupleData {
+                columns: vec![text_col("5"), text_col("7")],
+            };
+            assert_eq!(
+                filter
+                    .decide(Oid(42), &staying, table_name(), "INSERT")
+                    .unwrap(),
+                KeyMoveDecision::Skip
+            );
+        }
+
+        #[test]
+        fn decide_by_binary_key() {
+            let filter = filter(DataType::Bigint, &["11"]);
+
+            // Binary WAL columns decode through the sharding value.
+            let moving = TupleData {
+                columns: vec![text_col("5"), binary_col(&11_i64.to_be_bytes())],
+            };
+            assert_eq!(
+                filter
+                    .decide(Oid(42), &moving, table_name(), "UPDATE")
+                    .unwrap(),
+                KeyMoveDecision::Move
+            );
+        }
+
+        #[test]
+        fn missing_key_fails_loudly() {
+            let filter = filter(DataType::Bigint, &["11"]);
+
+            // A toasted key column can't be judged.
+            let toasted = TupleData {
+                columns: vec![text_col("5"), toasted_col()],
+            };
+            assert!(matches!(
+                filter.decide(Oid(42), &toasted, table_name(), "UPDATE"),
+                Err(Error::KeyMoveMissingKey { .. })
+            ));
+
+            // An unregistered relation can't be judged either.
+            let tuple = TupleData {
+                columns: vec![text_col("5"), text_col("11")],
+            };
+            assert!(matches!(
+                filter.decide(Oid(99), &tuple, table_name(), "DELETE"),
+                Err(Error::KeyMoveMissingKey { .. })
+            ));
+        }
     }
 
     #[test]
