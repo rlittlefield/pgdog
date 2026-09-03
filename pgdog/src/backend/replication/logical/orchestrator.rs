@@ -85,7 +85,6 @@ impl Orchestrator {
     /// Create an orchestrator for ADD SHARD: the source is a config
     /// database (scoped to one shard), the destination is a caller-owned
     /// provisioning cluster that no reload can re-resolve.
-    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
     pub(crate) fn for_provisioning(
         source: &str,
         destination: Cluster,
@@ -113,14 +112,12 @@ impl Orchestrator {
     /// Dump and restore schema without a publication. For databases
     /// with no omnisharded tables there is nothing to copy or stream:
     /// ADD SHARD only provisions DDL.
-    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
     pub(crate) fn schema_only(mut self) -> Self {
         self.schema_only = true;
         self
     }
 
     /// Restrict the replication source to a single shard.
-    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
     pub(crate) fn with_source_shard(mut self, shard: usize) -> Result<Self, Error> {
         self.source_shard = Some(shard);
         self.source = self.source.shard_view(shard)?;
@@ -154,6 +151,17 @@ impl Orchestrator {
     /// The publication both ends replicate through.
     pub(crate) fn publication(&self) -> &str {
         &self.publication
+    }
+
+    /// The destination cluster. For provisioning orchestrators this is
+    /// the caller-owned cluster the registry cannot resolve.
+    pub(crate) fn destination(&self) -> &Cluster {
+        &self.destination
+    }
+
+    /// Dump and restore schema without a publication.
+    pub(crate) fn is_schema_only(&self) -> bool {
+        self.schema_only
     }
 
     pub(crate) async fn data_sync(
@@ -296,13 +304,11 @@ impl ReplicationWaiter {
 
     /// Current replication lag, in bytes. `None` until every source
     /// shard has reported.
-    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
     pub(crate) async fn lag(&self) -> Option<u64> {
         self.orchestrator.replication_lag().await
     }
 
     /// Time since the last replicated transaction.
-    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
     pub(crate) async fn last_transaction(&self) -> Option<Duration> {
         self.orchestrator.publisher.lock().await.last_transaction()
     }

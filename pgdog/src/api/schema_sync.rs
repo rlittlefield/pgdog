@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 use crate::api::Task;
 use crate::api::task::TaskContext;
+use crate::backend::Cluster;
 use crate::backend::replication::logical::schema_sync::{
     SchemaSync, ShardRestore, StatementOutcome,
 };
@@ -57,6 +58,12 @@ pub(crate) struct SchemaSyncTask {
     ignore_errors: bool,
     #[builder(default)]
     dry_run: bool,
+    /// Caller-owned destination cluster (an ADD SHARD provisioning
+    /// shard) that the registry cannot resolve.
+    fixed_destination: Option<Cluster>,
+    /// Dump without a publication: schema only, nothing is copied.
+    #[builder(default)]
+    schema_only: bool,
 }
 
 impl Task for SchemaSyncTask {
@@ -82,11 +89,19 @@ impl Task for SchemaSyncTask {
         let cancel = ctx.cancellation_token();
 
         // Pools reload between phases, so resolve late.
-        let mut schema_sync = SchemaSync::new(
-            &self.databases.source,
-            &self.databases.destination,
-            &self.publication,
-        )?;
+        let mut schema_sync = match &self.fixed_destination {
+            Some(destination) => SchemaSync::for_provisioning(
+                &self.databases.source,
+                destination.clone(),
+                &self.publication,
+                self.schema_only,
+            )?,
+            None => SchemaSync::new(
+                &self.databases.source,
+                &self.databases.destination,
+                &self.publication,
+            )?,
+        };
 
         ctx.set_status(SchemaSyncStatus::LoadingSchema);
         let Some(dump) = cancel

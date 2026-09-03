@@ -53,12 +53,10 @@ const MARKER_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) const TOPIC: Topic = Topic::new("add_shard");
 
 /// How long the coordinator waits for every peer to arm its barrier.
-#[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
 pub(crate) const ARM_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the coordinator waits for every peer to activate. The
 /// activation stands either way; stragglers converge on their own.
-#[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
 pub(crate) const ACTIVATE_ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(crate) const STATE_ARMED: &str = "armed";

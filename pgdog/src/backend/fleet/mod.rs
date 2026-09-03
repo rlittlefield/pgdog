@@ -6,18 +6,10 @@
 pub mod barrier;
 pub mod registry;
 
-// TODO: remove the dead_code/unused_imports allows once the
-// coordination consumers land.
-#[allow(dead_code)]
 pub(crate) mod coordinator;
-#[allow(dead_code)]
 pub(crate) mod follower;
-#[allow(dead_code)]
 pub(crate) mod protocol;
 
-#[allow(unused_imports)]
 pub(crate) use coordinator::{Coordinator, Discovery};
-#[allow(unused_imports)]
 pub(crate) use follower::Follower;
-#[allow(unused_imports)]
 pub(crate) use protocol::Topic;

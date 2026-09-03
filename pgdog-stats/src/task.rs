@@ -60,6 +60,7 @@ pub enum TaskStatus {
     TableCopy(TableCopyStatus),
     Replication(ReplicationStatus),
     ReplicationSlot(ReplicationSlotStatus),
+    AddShard(AddShardStatus),
     /// Any other task status that is either doesn't report any status
     /// or is not compatible with other versions of tasks.
     #[default]
@@ -572,6 +573,40 @@ pub enum ReplicationStatus {
     Other,
 }
 
+/// Stages of adding a shard, reported as the ADD SHARD task's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AddShardStatus {
+    /// Checking that the cluster can grow in place.
+    #[display("validating")]
+    Validating,
+    /// Running the pre-data schema-sync child task.
+    #[display("syncing schema")]
+    SchemaSync,
+    /// Running the data-copy child task.
+    #[display("syncing data")]
+    SyncingData,
+    /// Running the post-data schema-sync child task.
+    #[display("finalizing schema")]
+    FinalizingSchema,
+    /// Streaming changes to catch the new shard up.
+    #[display("replicating")]
+    Replicating,
+    /// Caught up; waiting for an operator `CUTOVER`.
+    #[display("awaiting cutover")]
+    AwaitingCutover,
+    /// Omni writes paused; draining replication to zero.
+    #[display("draining")]
+    Draining,
+    /// Swapping the new shard into the topology.
+    #[display("swapping topology")]
+    SwappingTopology,
+    /// A stage this build does not know.
+    #[display("-")]
+    #[serde(other)]
+    Other,
+}
+
 /// The slot one per-shard replication subtask streams from.
 #[derive(Debug, Clone, PartialEq, Display, Serialize, Deserialize, JsonSchema)]
 #[display("{slot} on {host}:{port}/{database_name}")]
@@ -865,6 +900,7 @@ mod test {
                 lag_bytes: 4096,
                 last_transaction: Some(1_700_000_000_000),
             }),
+            TaskStatus::AddShard(AddShardStatus::AwaitingCutover),
             TaskStatus::Other,
         ];
 
@@ -882,6 +918,7 @@ mod test {
                 | TaskStatus::TableCopy(_)
                 | TaskStatus::Replication(_)
                 | TaskStatus::ReplicationSlot(_)
+                | TaskStatus::AddShard(_)
                 | TaskStatus::Other => (),
             }
         }

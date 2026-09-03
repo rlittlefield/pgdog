@@ -135,7 +135,6 @@ pub(crate) async fn register(cluster: &Cluster, shard: usize) -> Result<(), Erro
 
 /// Live instances registered on one shard of `cluster`. An empty list
 /// also covers `pgdog.instances` not being installed.
-#[allow(dead_code)] // TODO: remove once the coordination consumers land
 pub(crate) async fn live_instances(
     cluster: &Cluster,
     shard: usize,

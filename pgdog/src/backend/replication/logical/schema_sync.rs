@@ -19,6 +19,11 @@ pub(crate) struct SchemaSync {
     source: Cluster,
     destination: Cluster,
     publication: String,
+    /// The destination is caller-owned (an ADD SHARD provisioning
+    /// cluster), not a registry database: refresh must not re-resolve it.
+    fixed_destination: bool,
+    /// Dump without a publication: schema only, nothing is copied.
+    schema_only: bool,
 }
 
 impl SchemaSync {
@@ -31,6 +36,26 @@ impl SchemaSync {
             source: databases().schema_owner(source)?,
             destination: databases().schema_owner(destination)?,
             publication: publication.to_owned(),
+            fixed_destination: false,
+            schema_only: false,
+        })
+    }
+
+    /// Schema sync into a caller-owned destination cluster (an ADD SHARD
+    /// provisioning shard). With `schema_only`, the dump needs no
+    /// publication: nothing is copied or replicated.
+    pub(crate) fn for_provisioning(
+        source: &str,
+        destination: Cluster,
+        publication: &str,
+        schema_only: bool,
+    ) -> Result<Self, SchemaSyncError> {
+        Ok(Self {
+            source: databases().schema_owner(source)?,
+            destination,
+            publication: publication.to_owned(),
+            fixed_destination: true,
+            schema_only,
         })
     }
 
@@ -38,16 +63,21 @@ impl SchemaSync {
     /// (a schema sync of our own, a DDL reload, a cutover) reloaded the pools.
     fn refresh(&mut self) -> Result<(), SchemaSyncError> {
         self.source = databases().schema_owner(&self.source.identifier().database)?;
-        self.destination = databases().schema_owner(&self.destination.identifier().database)?;
+        if !self.fixed_destination {
+            self.destination = databases().schema_owner(&self.destination.identifier().database)?;
+        }
 
         Ok(())
     }
 
     /// Dump the source schema.
     pub(crate) async fn dump(&self) -> Result<Arc<PgDumpOutput>, SchemaSyncError> {
-        Ok(Arc::new(
-            PgDump::new(&self.source, &self.publication).dump().await?,
-        ))
+        let pg_dump = if self.schema_only {
+            PgDump::schema_only(&self.source)
+        } else {
+            PgDump::new(&self.source, &self.publication)
+        };
+        Ok(Arc::new(pg_dump.dump().await?))
     }
 
     /// Take a connection to one destination shard, to apply statements through.
@@ -69,6 +99,7 @@ impl SchemaSync {
     pub(crate) async fn reload_destination(&mut self) -> Result<(), SchemaSyncError> {
         reload_from_existing()?;
         self.refresh()?;
+
         self.destination.wait_ready().await;
 
         if self.destination.rewrite().primary_key == RewriteMode::RewriteOmni {
