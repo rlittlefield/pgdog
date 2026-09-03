@@ -39,6 +39,7 @@ pub(crate) enum ParseResult {
     Set(Set),
     Ban(Ban),
     Probe(Probe),
+    AddShard(AddShard),
     MaintenanceMode(MaintenanceMode),
     OmniWrites(OmniWrites),
     Healthcheck(Healthcheck),
@@ -89,6 +90,7 @@ impl ParseResult {
             Set(set) => set.execute().await,
             Ban(ban) => ban.execute().await,
             Probe(probe) => probe.execute().await,
+            AddShard(add_shard) => add_shard.execute().await,
             MaintenanceMode(maintenance_mode) => maintenance_mode.execute().await,
             OmniWrites(omni_writes) => omni_writes.execute().await,
             Healthcheck(healthcheck) => healthcheck.execute().await,
@@ -139,6 +141,7 @@ impl ParseResult {
             Set(set) => set.name(),
             Ban(ban) => ban.name(),
             Probe(probe) => probe.name(),
+            AddShard(add_shard) => add_shard.name(),
             MaintenanceMode(maintenance_mode) => maintenance_mode.name(),
             OmniWrites(omni_writes) => omni_writes.name(),
             Healthcheck(healthcheck) => healthcheck.name(),
@@ -250,6 +253,13 @@ impl Parser {
                 "schema" => ParseResult::SetupSchema(SetupSchema::parse(&sql)?),
                 command => {
                     debug!("unknown admin show command: '{}'", command);
+                    return Err(Error::Syntax);
+                }
+            },
+            "add" => match iter.next().ok_or(Error::Syntax)?.trim() {
+                "shard" => ParseResult::AddShard(AddShard::parse(&sql)?),
+                command => {
+                    debug!("unknown admin add command: '{}'", command);
                     return Err(Error::Syntax);
                 }
             },
