@@ -291,8 +291,10 @@ pub(crate) async fn cutover(source: &str, destination: &str) -> Result<(), Error
 
 /// Build a launched, non-serving one-shard `Cluster` on shard 0 of a
 /// serving database: the arbiter pgdog asks when the config alone
-/// can't answer, starting with the `pgdog.config` marker that gates
-/// pending shards. The caller owns it and must shut it down when done:
+/// can't answer: the `pgdog.config` marker that gates pending shards,
+/// MOVE KEYS' cross-instance advisory lock, and the medium its cutover
+/// hands the coordination seam.
+/// The caller owns it and must shut it down when done:
 /// handing out the serving cluster would kill live pools on its
 /// shutdown. Uses the database's `schema_admin` user's credentials.
 pub(crate) fn shard_zero_cluster(database: &str) -> Result<Cluster, Error> {
