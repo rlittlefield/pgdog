@@ -90,7 +90,6 @@ pub(crate) enum Error {
     PublicationHasRowFilter(String),
 
     #[error("hybrid sharded table must set a table name (column \"{0}\")")]
-    #[allow(dead_code)] // TODO: remove once ADD SHARD threads hybrid tables
     HybridUnnamedTable(String),
 
     #[error("hybrid table \"{table}\" sharding column \"{column}\" does not exist")]
