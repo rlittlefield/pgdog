@@ -112,6 +112,7 @@ pub(crate) fn init() -> Result<(), Error> {
     let _monitor = Manager::get();
 
     // Converge provisioning shards and keep their agents running.
+    crate::backend::provisioning::on_config_change();
 
     Ok(())
 }
@@ -159,6 +160,7 @@ pub(crate) fn reload() -> Result<(), Error> {
     Cache::resize(new_config.config.general.query_cache_limit);
 
     // Converge provisioning shards and keep their agents running.
+    crate::backend::provisioning::on_config_change();
 
     Ok(())
 }
@@ -292,7 +294,6 @@ pub(crate) async fn cutover(source: &str, destination: &str) -> Result<(), Error
 /// the caller owns it and must shut it down when done. Uses the
 /// database's `schema_admin` user's credentials, same as the serving
 /// shards.
-#[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
 pub(crate) fn provisioning_cluster(database: &str, shard: usize) -> Result<Cluster, Error> {
     let config = config();
     let general = &config.config.general;
@@ -371,7 +372,6 @@ pub(crate) fn provisioning_cluster(database: &str, shard: usize) -> Result<Clust
 /// the shard's own `pgdog.config` marker is what restarts and RELOADs
 /// converge from until the operator removes the flag at the source.
 /// Used by `ADD SHARD` at the point of no return.
-#[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
 pub(crate) async fn activate_provisioning_shard(database: &str, shard: usize) -> Result<(), Error> {
     {
         let _lock = lock();
@@ -396,6 +396,7 @@ pub(crate) async fn activate_provisioning_shard(database: &str, shard: usize) ->
 
         // The next declared shard (if any) gets its agent, and its
         // convergence check runs, without waiting for a reload.
+        crate::backend::provisioning::on_config_change();
     }
 
     info!(

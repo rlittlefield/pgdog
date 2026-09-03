@@ -10,6 +10,7 @@ pub(crate) mod maintenance_mode;
 pub(crate) mod pool;
 pub(crate) mod prepared_statements;
 pub(crate) mod protocol;
+pub(crate) mod provisioning;
 pub(crate) mod pub_sub;
 pub(crate) mod reload_notify;
 pub(crate) mod reload_signal;
