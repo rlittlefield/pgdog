@@ -20,6 +20,7 @@
 //! arm, drain, flip, invalidate), and [`cleanup`] (source deletion,
 //! and the target scrub on pre-flip aborts).
 
+mod cleanup;
 mod copy;
 mod guards;
 
