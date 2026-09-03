@@ -17,7 +17,7 @@ pub(crate) struct Copy {
 
 impl Copy {
     pub(crate) fn new(table: &Table, copy_format: CopyFormat) -> Self {
-        let stmt = CopyStatement::new(
+        let mut stmt = CopyStatement::new(
             &table.table,
             &table
                 .columns
@@ -26,6 +26,9 @@ impl Copy {
                 .collect::<Vec<_>>(),
             copy_format,
         );
+        if let Some(column) = &table.null_filter_column {
+            stmt = stmt.with_null_filter(column);
+        }
 
         Self { stmt }
     }
