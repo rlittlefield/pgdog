@@ -158,6 +158,21 @@ impl ShardedTables {
         &self.inner.lookup_cache
     }
 
+    /// Drop cached lookup translations for these sharding key values.
+    /// The next statement using one re-runs its lookup query and reads
+    /// the current placement.
+    #[allow(dead_code)] // TODO: remove once MOVE KEYS lands
+    pub(crate) fn invalidate_lookup_keys(&self, keys: &[String]) {
+        for table in self.tables() {
+            if table.lookup_query.is_none() {
+                continue;
+            }
+            for key in keys {
+                self.lookup_cache().invalidate_for_table(table, key);
+            }
+        }
+    }
+
     pub(crate) fn omnishards(&self) -> &HashMap<String, bool> {
         &self.inner.omnisharded
     }
@@ -238,6 +253,37 @@ mod test {
 
         // Clones of the same instance share it.
         assert!(first.clone().lookup_cache().get(&table, "child").is_some());
+    }
+
+    #[test]
+    fn test_invalidate_lookup_keys() {
+        use crate::frontend::router::sharding::ShardedTable;
+
+        let sharded = ShardedTable {
+            database: "pgdog".into(),
+            name: Some("orders".into()),
+            column: "tenant_id".into(),
+            lookup_query: Some("SELECT shard_id FROM tenants WHERE id = $1".into()),
+            ..Default::default()
+        };
+        let tables = ShardedTables::new(
+            vec![sharded.clone()],
+            vec![],
+            false,
+            SystemCatalogsBehavior::default(),
+        );
+
+        let cache = tables.lookup_cache();
+        for value in ["11", "12", "13"] {
+            cache.insert(LookupTable::from(&sharded), value.into(), "0".into());
+        }
+
+        tables.invalidate_lookup_keys(&["11".into(), "12".into()]);
+
+        assert!(cache.get_for_table(&sharded, "11").is_none());
+        assert!(cache.get_for_table(&sharded, "12").is_none());
+        // Untouched keys stay cached.
+        assert!(cache.get_for_table(&sharded, "13").is_some());
     }
 }
 
