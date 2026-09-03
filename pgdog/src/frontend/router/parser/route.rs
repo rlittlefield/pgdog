@@ -204,7 +204,6 @@ impl Route {
 
     /// Sharding key values that routed this query. Only recorded while
     /// a keyed write barrier is armed; empty in steady state.
-    #[allow(dead_code)] // TODO: remove once the keyed-barrier parking lands
     pub fn sharding_keys(&self) -> &[String] {
         &self.sharding_keys
     }
