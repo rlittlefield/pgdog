@@ -41,6 +41,7 @@ pub(crate) enum ParseResult {
     Probe(Probe),
     AddShard(AddShard),
     MaintenanceMode(MaintenanceMode),
+    MoveKeys(MoveKeys),
     OmniWrites(OmniWrites),
     Healthcheck(Healthcheck),
     Reshard(Reshard),
@@ -92,6 +93,7 @@ impl ParseResult {
             Probe(probe) => probe.execute().await,
             AddShard(add_shard) => add_shard.execute().await,
             MaintenanceMode(maintenance_mode) => maintenance_mode.execute().await,
+            MoveKeys(move_keys) => move_keys.execute().await,
             OmniWrites(omni_writes) => omni_writes.execute().await,
             Healthcheck(healthcheck) => healthcheck.execute().await,
             Reshard(reshard) => reshard.execute().await,
@@ -143,6 +145,7 @@ impl ParseResult {
             Probe(probe) => probe.name(),
             AddShard(add_shard) => add_shard.name(),
             MaintenanceMode(maintenance_mode) => maintenance_mode.name(),
+            MoveKeys(move_keys) => move_keys.name(),
             OmniWrites(omni_writes) => omni_writes.name(),
             Healthcheck(healthcheck) => healthcheck.name(),
             Reshard(reshard) => reshard.name(),
@@ -204,7 +207,10 @@ impl Parser {
             });
         }
 
-        let sql = sql.replace(";", "").to_lowercase();
+        // Keywords match on the lowercased copy; commands whose
+        // arguments are values (e.g. MOVE KEYS) parse the original.
+        let original = sql.replace(";", "");
+        let sql = original.to_lowercase();
         let mut iter = sql.split(" ");
 
         Ok(match iter.next().ok_or(Error::Syntax)?.trim() {
@@ -271,6 +277,14 @@ impl Parser {
             "cutover" => ParseResult::Cutover(Cutover::parse(&sql)?),
             "probe" => ParseResult::Probe(Probe::parse(&sql)?),
             "maintenance" => ParseResult::MaintenanceMode(MaintenanceMode::parse(&sql)?),
+            "move" => match iter.next().ok_or(Error::Syntax)?.trim() {
+                // Keys are values: parse the case-preserved input.
+                "keys" => ParseResult::MoveKeys(MoveKeys::parse(&original)?),
+                command => {
+                    debug!("unknown admin move command: '{}'", command);
+                    return Err(Error::Syntax);
+                }
+            },
             "omni_writes" => ParseResult::OmniWrites(OmniWrites::parse(&sql)?),
             command => {
                 debug!("unknown admin command: {}", command);
