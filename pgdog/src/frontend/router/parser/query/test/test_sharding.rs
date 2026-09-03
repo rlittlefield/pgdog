@@ -6,6 +6,8 @@ use std::ops::Deref;
 
 use super::setup::{QueryParserTest, *};
 
+use crate::frontend::router::parser::route::ShardSource;
+use crate::net::parameter::ParameterValue;
 use pgdog_config::ShardedTableConfig;
 
 #[test]
@@ -371,6 +373,168 @@ fn test_set_sharding_key_goes_through_lookup() {
         command.route().shard(),
         &shard_value("org_root", &DataType::Varchar, 2, &vec![], 0)
     );
+}
+
+/// While a keyed write barrier is armed (MOVE KEYS), routes record the
+/// sharding key values that routed the statement, in every form they
+/// arrive in, so the query engine can park writes for paused keys.
+/// Steady state records nothing.
+#[test]
+fn test_route_records_keys_while_barrier_armed() {
+    use crate::backend::fleet::barrier;
+
+    let tables = lookup_rule_tables();
+    warm_lookup_cache(&tables, "org_child", "org_root");
+    let mut test = QueryParserTest::new().with_sharded_tables(tables.clone());
+
+    let update = "UPDATE some_table SET value = 1 WHERE organization_id = 'org_child'";
+
+    // Steady state: no keys recorded.
+    let command = test.execute(vec![Query::new(update).into()]);
+    assert!(command.route().sharding_keys().is_empty());
+
+    // Armed (for any database): a statement-embedded key is recorded.
+    barrier::start_keys("keyed_route_test_db", &["11".to_string()]);
+    let command = test.execute(vec![Query::new(update).into()]);
+    assert_eq!(command.route().sharding_keys(), ["org_child"]);
+
+    // A comment-directive key is recorded. (Keys are recorded on
+    // reads too; only writes consult them at the barrier.)
+    let command = test.execute(vec![
+        Query::new("/* pgdog_sharding_key: 'org_child' */ SELECT * FROM some_table").into(),
+    ]);
+    assert_eq!(command.route().sharding_keys(), ["org_child"]);
+
+    barrier::stop_keys("keyed_route_test_db");
+}
+
+/// `SET pgdog.sharding_key` keys are recorded on the route while a
+/// keyed write barrier is armed.
+#[test]
+fn test_route_records_set_key_while_barrier_armed() {
+    use crate::backend::fleet::barrier;
+
+    let tables = lookup_rule_tables();
+    warm_lookup_cache(&tables, "org_child", "org_root");
+    let mut test = QueryParserTest::new()
+        .with_sharded_tables(tables)
+        .without_sharded_schemas()
+        .with_param("pgdog.sharding_key", "org_child");
+
+    barrier::start_keys("keyed_route_set_test_db", &["11".to_string()]);
+    let command = test.execute(vec![Query::new("SELECT * FROM some_table").into()]);
+    assert_eq!(command.route().sharding_keys(), ["org_child"]);
+    barrier::stop_keys("keyed_route_set_test_db");
+}
+
+/// A write that only touches omnisharded tables must reach every
+/// shard: a shard directive on it is an error, with a cold cache
+/// (the key's lookup doesn't run) and with a warm one.
+#[test]
+fn test_comment_key_errors_on_omnisharded_write() {
+    use crate::frontend::router::parser::Error;
+
+    // Cold cache.
+    let tables = lookup_rule_tables();
+    let mut test = QueryParserTest::new().with_sharded_tables(tables.clone());
+    let result = test.try_execute(vec![
+        Query::new(
+            "/* pgdog_sharding_key: 'org_child' */ INSERT INTO organizations (id, name) VALUES ('org_child', 'child')",
+        )
+        .into(),
+    ]);
+    assert!(matches!(result, Err(Error::OmniWriteWithDirective)));
+
+    // Warm cache.
+    warm_lookup_cache(&tables, "org_child", "org_root");
+    let result = test.try_execute(vec![
+        Query::new(
+            "/* pgdog_sharding_key: 'org_child' */ INSERT INTO organizations (id, name) VALUES ('org_child', 'child')",
+        )
+        .into(),
+    ]);
+    assert!(matches!(result, Err(Error::OmniWriteWithDirective)));
+
+    // An explicit shard directive errors the same way.
+    let result = test.try_execute(vec![
+        Query::new(
+            "/* pgdog_shard: 1 */ INSERT INTO organizations (id, name) VALUES ('org_child', 'child')",
+        )
+        .into(),
+    ]);
+    assert!(matches!(result, Err(Error::OmniWriteWithDirective)));
+
+    // Without the directive, the write broadcasts.
+    let command = test.execute(vec![
+        Query::new("INSERT INTO organizations (id, name) VALUES ('org_child', 'child')").into(),
+    ]);
+    assert!(command.route().is_omnisharded());
+    assert_eq!(command.route().shard(), &Shard::All);
+
+    // Reads keep the directive: any shard holds the data.
+    let command = test.execute(vec![
+        Query::new("/* pgdog_sharding_key: 'org_child' */ SELECT * FROM organizations").into(),
+    ]);
+    assert!(command.route().is_omnisharded());
+    assert!(command.route().shard().is_direct());
+}
+
+/// A search_path route defers rejecting a comment key whose lookup missed the
+/// cache. The pending lookup is resolved before execution, and the second
+/// routing pass can then decide whether the comment overrides search_path.
+#[test]
+fn test_search_path_defers_omnisharded_write_with_pending_comment_key() {
+    let tables = lookup_rule_tables();
+    let mut test = QueryParserTest::new()
+        .with_sharded_tables(tables)
+        .with_param("search_path", ParameterValue::String("shard_0".into()));
+
+    let command = test.execute(vec![
+        Query::new(
+            "/* pgdog_sharding_key: 'org_child' */ INSERT INTO organizations (id, name) VALUES ('org_child', 'child')",
+        )
+        .into(),
+    ]);
+
+    assert!(command.route().is_omnisharded());
+    assert!(command.route().is_search_path_driven());
+    assert_eq!(command.route().pending_lookups().len(), 1);
+    assert_eq!(command.route().shard(), &Shard::Direct(0));
+    assert_eq!(
+        command.route().shard_with_priority().source(),
+        &ShardSource::SearchPath("shard_0".into())
+    );
+}
+
+/// Once the deferred comment lookup resolves, routing checks the omnisharded
+/// write again. The higher-priority comment now selects one shard, so the write
+/// must be rejected instead of partially updating the table.
+#[test]
+fn test_resolved_comment_key_errors_on_search_path_omnisharded_write() {
+    use crate::frontend::router::parser::Error;
+    use crate::frontend::router::sharding::{LookupTable, ResolvedLookups};
+
+    let key = LookupTable {
+        schema: None,
+        name: None,
+        column: "organization_id".into(),
+    };
+    let mut resolved = ResolvedLookups::default();
+    resolved.insert(key, "org_child".into(), "org_root".into());
+
+    let mut test = QueryParserTest::new()
+        .with_sharded_tables(lookup_rule_tables())
+        .with_param("search_path", ParameterValue::String("shard_0".into()))
+        .with_resolved_lookups(resolved);
+
+    let result = test.try_execute(vec![
+        Query::new(
+            "/* pgdog_sharding_key: 'org_child' */ INSERT INTO organizations (id, name) VALUES ('org_child', 'child')",
+        )
+        .into(),
+    ]);
+
+    assert!(matches!(result, Err(Error::OmniWriteWithDirective)));
 }
 
 /// SET pgdog.sharding_key errors on omnisharded writes the same way.
