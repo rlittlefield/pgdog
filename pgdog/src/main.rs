@@ -165,6 +165,10 @@ async fn pgdog(command: Option<Commands>) -> Result<(), Box<dyn std::error::Erro
     // Register this instance with the databases it serves.
     backend::fleet::registry::start();
 
+    // Converge any provisioning shards declared in the config whose
+    // pgdog.config marker says they are already active.
+    backend::provisioning::converge_at_startup().await;
+
     let general = &config().config.general;
 
     install_log_throttle(general);

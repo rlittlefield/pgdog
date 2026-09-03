@@ -26,7 +26,7 @@ use crate::config::PoolerMode;
 use crate::frontend::PreparedStatements;
 use crate::frontend::client::query_engine::two_pc::Manager;
 use crate::frontend::router::parser::Cache;
-use crate::frontend::router::sharding::{Mapping, ShardedTable};
+use crate::frontend::router::sharding::{LookupCache, Mapping, ShardedTable};
 use crate::{
     backend::pool::PoolConfig,
     config::{ConfigAndUsers, ShardedMappingDeprecated, User as ConfigUser, config, load, set},
@@ -111,6 +111,9 @@ pub(crate) fn init() -> Result<(), Error> {
     // Start two-pc manager.
     let _monitor = Manager::get();
 
+    // Converge provisioning shards and keep their agents running.
+    crate::backend::provisioning::on_config_change();
+
     Ok(())
 }
 
@@ -155,6 +158,9 @@ pub(crate) fn reload() -> Result<(), Error> {
 
     // Resize query cache.
     Cache::resize(new_config.config.general.query_cache_limit);
+
+    // Converge provisioning shards and keep their agents running.
+    crate::backend::provisioning::on_config_change();
 
     Ok(())
 }
@@ -281,6 +287,125 @@ pub(crate) async fn cutover(source: &str, destination: &str) -> Result<(), Error
     Ok(())
 }
 
+/// Build a launched, non-serving one-shard `Cluster` for a shard being
+/// provisioned by `ADD SHARD`, from its `provisioning = true` entry.
+/// Several future shards can be declared at once; `shard` names the
+/// one being worked on. The cluster shares nothing with the registry:
+/// the caller owns it and must shut it down when done. Uses the
+/// database's `schema_admin` user's credentials, same as the serving
+/// shards.
+pub(crate) fn provisioning_cluster(database: &str, shard: usize) -> Result<Cluster, Error> {
+    let config = config();
+    let general = &config.config.general;
+
+    let user = config
+        .users
+        .users
+        .iter()
+        .find(|user| user.database == database && user.schema_admin)
+        .ok_or(Error::NoSchemaAdmin(database.to_string()))?;
+
+    let entries = config
+        .config
+        .databases
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.provisioning && entry.name == database && entry.shard == shard)
+        .collect::<Vec<_>>();
+
+    let (number, entry) = match entries.as_slice() {
+        [one] => *one,
+        [] => {
+            return Err(Error::NoProvisioningShard(format!(
+                "{} shard {}",
+                database, shard
+            )));
+        }
+        _ => {
+            return Err(Error::MultipleProvisioningShards(format!(
+                "{} shard {}",
+                database, shard
+            )));
+        }
+    };
+
+    let enumerated = EnumeratedDatabase {
+        number,
+        database: entry.clone(),
+    };
+    let nodes = [enumerated];
+    let shard_nodes = pgdog_config::pool::ShardNodes::new(&nodes);
+    let primary = PoolConfig {
+        address: Address::new(entry, user, number),
+        config: pgdog_config::pool::PoolConfig::resolve(general, &shard_nodes, entry, user),
+    };
+    let shard_configs = vec![ClusterShardConfig {
+        primary: Some(primary),
+        replicas: vec![],
+    }];
+
+    let query_parser = QueryParser {
+        database: database.to_string(),
+        level: general.query_parser,
+        engine: general.query_parser_engine,
+    };
+
+    let cluster_config = ClusterConfig::new(
+        &config.config,
+        user,
+        &shard_configs,
+        ShardedTables::default(),
+        ShardedSchemas::default(),
+        query_parser,
+        SchemaCache::default(),
+    );
+
+    let cluster = Cluster::new(cluster_config);
+    cluster.launch();
+
+    Ok(cluster)
+}
+
+/// Activate a provisioning shard: flip its `provisioning` flag off in
+/// the running config, validate, and rebuild the databases registry,
+/// all under the config lock. The config source is never rewritten:
+/// the shard's own `pgdog.config` marker is what restarts and RELOADs
+/// converge from until the operator removes the flag at the source.
+/// Used by `ADD SHARD` at the point of no return.
+pub(crate) async fn activate_provisioning_shard(database: &str, shard: usize) -> Result<(), Error> {
+    {
+        let _lock = lock();
+
+        let mut config = config().deref().clone();
+        let mut found = false;
+        for entry in config.config.databases.iter_mut() {
+            if entry.provisioning && entry.name == database && entry.shard == shard {
+                entry.provisioning = false;
+                found = true;
+            }
+        }
+        if !found {
+            return Err(Error::NoProvisioningShard(database.to_string()));
+        }
+
+        // Runs config checks and lookup query validation.
+        crate::config::set(config.clone())?;
+
+        let databases = from_config(&config);
+        replace_databases(databases, true)?;
+
+        // The next declared shard (if any) gets its agent, and its
+        // convergence check runs, without waiting for a reload.
+        crate::backend::provisioning::on_config_change();
+    }
+
+    info!(
+        r#"shard {} of database "{}" is now active"#,
+        shard, database
+    );
+
+    Ok(())
+}
 pub(crate) use pgdog_stats::User;
 
 /// Convert to a database/user pair.
@@ -594,11 +719,12 @@ fn new_pool(
         .get(&user.database)
         .cloned()
         .unwrap_or(vec![]);
-    let sharded_tables = ShardedTables::new(
+    let sharded_tables = ShardedTables::with_lookup_cache(
         sharded_tables,
         omnisharded_tables,
         general.omnisharded_sticky,
         general.system_catalogs,
+        LookupCache::new(general.sharding_lookup_cache_size as u64),
     );
     let sharded_schemas = ShardedSchemas::new(sharded_schemas);
     let query_parser = config
