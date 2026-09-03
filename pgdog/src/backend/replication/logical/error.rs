@@ -90,7 +90,6 @@ pub(crate) enum Error {
     PublicationHasRowFilter(String),
 
     #[error("sharded table with broadcast_null must set a table name (column \"{0}\")")]
-    #[allow(dead_code)] // TODO: remove once ADD SHARD threads broadcast_null
     BroadcastNullUnnamedTable(String),
 
     #[error(

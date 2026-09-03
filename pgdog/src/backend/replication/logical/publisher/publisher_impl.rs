@@ -76,7 +76,6 @@ impl Publisher {
 
     /// Restrict the given tables to their NULL-key rows during copy
     /// and replication.
-    #[allow(dead_code)] // TODO: remove once ADD SHARD threads broadcast_null
     pub(crate) fn with_hybrid_tables(mut self, hybrid_tables: Vec<HybridNullTable>) -> Self {
         self.hybrid_tables = hybrid_tables;
         self

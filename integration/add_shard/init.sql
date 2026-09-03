@@ -7,15 +7,19 @@
 \c pgdog1
 SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE '__pgdog%';
 DROP PUBLICATION IF EXISTS __pgdog_suite;
-DROP TABLE IF EXISTS public.orgs, public.data, pgdog.orgs, pgdog.data CASCADE;
+DROP TABLE IF EXISTS public.orgs, public.data, public.packages, pgdog.orgs, pgdog.data CASCADE;
 CREATE TABLE public.orgs (id VARCHAR PRIMARY KEY, shard_id BIGINT NOT NULL);
 CREATE TABLE public.data (id BIGSERIAL, org_id VARCHAR NOT NULL, value TEXT, PRIMARY KEY (id, org_id));
+-- Hybrid (broadcast_null) table: org_id NULL rows exist on every
+-- shard; ids are app-supplied so broadcast rows stay identical.
+CREATE TABLE public.packages (id BIGINT PRIMARY KEY, org_id VARCHAR, value TEXT);
 
 \c pgdog2
 SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name LIKE '__pgdog%';
-DROP TABLE IF EXISTS public.orgs, public.data, pgdog.orgs, pgdog.data CASCADE;
+DROP TABLE IF EXISTS public.orgs, public.data, public.packages, pgdog.orgs, pgdog.data CASCADE;
 CREATE TABLE public.orgs (id VARCHAR PRIMARY KEY, shard_id BIGINT NOT NULL);
 CREATE TABLE public.data (id BIGSERIAL, org_id VARCHAR NOT NULL, value TEXT, PRIMARY KEY (id, org_id));
+CREATE TABLE public.packages (id BIGINT PRIMARY KEY, org_id VARCHAR, value TEXT);
 
 -- The new shard starts completely empty: every non-system schema goes,
 -- including pgdog's internal ones (the restore and setup recreate them)

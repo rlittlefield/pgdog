@@ -1,7 +1,7 @@
-//! The degenerate path: a database with no omnisharded tables has
-//! nothing to copy or stream, and no writes to pause. Sync the schema
-//! (pre and post phases), park for the operator unless auto, and
-//! activate.
+//! The degenerate path: a database with no omnisharded or hybrid
+//! (`broadcast_null`) tables has nothing to copy or stream, and no
+//! writes to pause. Sync the schema (pre and post phases), park for
+//! the operator unless auto, and activate.
 
 use tokio::select;
 
@@ -17,19 +17,24 @@ use crate::backend::replication::logical::Error;
 use crate::backend::replication::logical::orchestrator::Orchestrator;
 use tokio_util::sync::CancellationToken;
 
-/// Entry: guards passed, no omnisharded tables. Exit: DDL synced, the
-/// shard activated fleet-wide. Failure before activation: propagates,
-/// nothing to unwind beyond the guards. No publication, copy,
-/// replication, or write pause is involved.
+/// Entry: guards passed, no omnisharded or hybrid tables. Exit: DDL
+/// synced, the shard activated fleet-wide. Failure before activation:
+/// propagates, nothing to unwind beyond the guards. No publication,
+/// copy, replication, or write pause is involved.
 pub(super) async fn run(
     task: &AddShardTask,
     ctx: &TaskContext<AddShardTask>,
     token: &CancellationToken,
     preflight: &Preflight,
 ) -> Result<(), MigrationError> {
-    let orchestrator =
-        Orchestrator::for_provisioning(&task.database, preflight.destination().clone(), "", 0)?
-            .schema_only();
+    let orchestrator = Orchestrator::for_provisioning(
+        &task.database,
+        preflight.destination().clone(),
+        "",
+        0,
+        vec![],
+    )?
+    .schema_only();
 
     let orchestrator = provision::sync_schema_pre(task, ctx, orchestrator).await?;
     let _ = provision::sync_schema_post(task, ctx, orchestrator).await?;
