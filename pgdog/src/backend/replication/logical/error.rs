@@ -86,6 +86,16 @@ pub(crate) enum Error {
     #[error("publication \"{0}\" exists with a different table set")]
     PublicationMismatch(String),
 
+    #[error("publication \"{0}\" has row filters; ADD SHARD requires an unfiltered publication")]
+    PublicationHasRowFilter(String),
+
+    #[error("hybrid sharded table must set a table name (column \"{0}\")")]
+    #[allow(dead_code)] // TODO: remove once ADD SHARD threads hybrid tables
+    HybridUnnamedTable(String),
+
+    #[error("hybrid table \"{table}\" sharding column \"{column}\" does not exist")]
+    HybridColumnMissing { table: String, column: String },
+
     #[error(
         "sharded table \"{0}\" is routed by hashing; adding a shard would move its rows. \
          Use lookup_result = \"shard\" or an explicit mapping, or reshard instead"
