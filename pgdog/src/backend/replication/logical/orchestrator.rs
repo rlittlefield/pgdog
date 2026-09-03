@@ -26,6 +26,15 @@ pub(crate) struct Orchestrator {
     publication: String,
     publisher: Arc<Mutex<Publisher>>,
     replication_slot: String,
+    /// Restrict the replication source to a single shard, e.g. ADD
+    /// SHARD reads omnisharded tables from shard 0 only.
+    source_shard: Option<usize>,
+    /// The destination is caller-owned (a provisioning shard's cluster),
+    /// not a config database: `refresh()` must not re-resolve it.
+    fixed_destination: bool,
+    /// Dump and restore schema without a publication: nothing is
+    /// copied or replicated, so no publication is required to exist.
+    schema_only: bool,
 }
 
 /// A handle to a publication's replication slots, decoupled from the rest of
@@ -63,6 +72,9 @@ impl Orchestrator {
             publication: publication.to_owned(),
             publisher: Arc::new(Mutex::new(Publisher::default())),
             replication_slot,
+            source_shard: None,
+            fixed_destination: false,
+            schema_only: false,
         };
 
         orchestrator.refresh_publisher();
@@ -70,10 +82,61 @@ impl Orchestrator {
         Ok(orchestrator)
     }
 
+    /// Create an orchestrator for ADD SHARD: the source is a config
+    /// database (scoped to one shard), the destination is a caller-owned
+    /// provisioning cluster that no reload can re-resolve.
+    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
+    pub(crate) fn for_provisioning(
+        source: &str,
+        destination: Cluster,
+        publication: &str,
+        source_shard: usize,
+    ) -> Result<Self, Error> {
+        let source = databases().schema_owner(source)?;
+
+        let replication_slot = format!("__pgdog_repl_{}", random_string(19).to_lowercase());
+
+        let mut orchestrator = Self {
+            source,
+            destination,
+            publication: publication.to_owned(),
+            publisher: Arc::new(Mutex::new(Publisher::default())),
+            replication_slot,
+            source_shard: None,
+            fixed_destination: true,
+            schema_only: false,
+        };
+        orchestrator.refresh_publisher();
+        orchestrator.with_source_shard(source_shard)
+    }
+
+    /// Dump and restore schema without a publication. For databases
+    /// with no omnisharded tables there is nothing to copy or stream:
+    /// ADD SHARD only provisions DDL.
+    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
+    pub(crate) fn schema_only(mut self) -> Self {
+        self.schema_only = true;
+        self
+    }
+
+    /// Restrict the replication source to a single shard.
+    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
+    pub(crate) fn with_source_shard(mut self, shard: usize) -> Result<Self, Error> {
+        self.source_shard = Some(shard);
+        self.source = self.source.shard_view(shard)?;
+        self.refresh_publisher();
+        Ok(self)
+    }
+
     /// Reload source/dest cluster references from the live databases registry.
     pub(crate) fn refresh(&mut self) -> Result<(), Error> {
         self.source = databases().schema_owner(&self.source.identifier().database)?;
-        self.destination = databases().schema_owner(&self.destination.identifier().database)?;
+        if !self.fixed_destination {
+            self.destination = databases().schema_owner(&self.destination.identifier().database)?;
+        }
+        if let Some(shard) = self.source_shard {
+            self.source = self.source.shard_view(shard)?;
+        }
         Ok(())
     }
 
@@ -229,6 +292,19 @@ impl ReplicationWaiter {
     /// The source database's name, e.g. for cutover registration.
     pub(crate) fn source_database(&self) -> String {
         self.orchestrator.source.identifier().database.clone()
+    }
+
+    /// Current replication lag, in bytes. `None` until every source
+    /// shard has reported.
+    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
+    pub(crate) async fn lag(&self) -> Option<u64> {
+        self.orchestrator.replication_lag().await
+    }
+
+    /// Time since the last replicated transaction.
+    #[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
+    pub(crate) async fn last_transaction(&self) -> Option<Duration> {
+        self.orchestrator.publisher.lock().await.last_transaction()
     }
 
     /// Wait for replication to catch up.
@@ -517,6 +593,9 @@ mod tests {
                 publication,
                 publisher: Arc::new(Mutex::new(publisher)),
                 replication_slot,
+                source_shard: None,
+                fixed_destination: false,
+                schema_only: false,
             }
         }
     }

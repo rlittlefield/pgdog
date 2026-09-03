@@ -6,6 +6,8 @@ pub(crate) use slot::*;
 pub(crate) mod copy;
 pub(crate) mod parallel_sync;
 pub(crate) mod progress;
+#[allow(dead_code)] // TODO: remove once ADD SHARD provisioning lands
+pub(crate) mod publication;
 pub(crate) mod publisher_impl;
 pub(crate) mod queries;
 pub(crate) mod table;
