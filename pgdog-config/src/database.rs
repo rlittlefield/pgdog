@@ -206,6 +206,13 @@ pub struct Database {
     /// Used for resharding only; this database will not serve regular traffic.
     #[serde(default)]
     pub resharding_only: bool,
+    /// Derived at runtime, never read from the config file: this entry
+    /// is a shard declared in its final shape (`name`, `shard`, `host`)
+    /// that the cluster hasn't confirmed yet, so it stays out of the
+    /// serving topology until `ADD SHARD` provisions and activates it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub provisioning: bool,
     /// Used for weighted load balancing.
     #[serde(default = "Database::lb_weight")]
     pub lb_weight: u8,

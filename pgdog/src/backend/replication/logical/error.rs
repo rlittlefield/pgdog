@@ -104,8 +104,13 @@ pub(crate) enum Error {
     ProvisioningShardNotNext { declared: usize, expected: usize },
 
     #[error("another pgdog instance is already provisioning this shard")]
-    #[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
     ProvisioningLocked,
+
+    #[error(
+        "the provisioning lock's session died, releasing the lock to other pgdog instances; rerun ADD SHARD"
+    )]
+    #[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
+    ProvisioningLockLost,
 
     #[error(
         "pgdog instance(s) [{0}] haven't registered on the new shard; deploy the config with the provisioning entry everywhere first"
