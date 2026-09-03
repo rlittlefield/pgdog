@@ -2,7 +2,6 @@ pub(crate) mod add_shard;
 pub(crate) mod copy_statement;
 pub(crate) mod ee;
 pub(crate) mod error;
-#[allow(dead_code)] // TODO: remove once the MOVE KEYS task lands
 pub(crate) mod move_keys;
 pub(crate) mod orchestrator;
 pub(crate) mod publisher;
