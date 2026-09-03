@@ -17,6 +17,7 @@ pub(crate) mod replication;
 pub(crate) mod resharding;
 pub(crate) mod schema_sync;
 pub(crate) mod task;
+pub(crate) mod topology_guard;
 
 /// Process-global task registry shared by all `crate::api` task modules.
 static TASKS: LazyLock<TaskStorage> = LazyLock::new(TaskStorage::default);
