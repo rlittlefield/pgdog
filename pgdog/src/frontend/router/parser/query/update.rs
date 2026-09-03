@@ -22,6 +22,7 @@ impl QueryParser {
         let shard = parser.shard()?;
         let pending_lookups = parser.take_pending_lookups();
         context.pending_lookups.extend(pending_lookups);
+        context.sharding_keys.extend(parser.take_sharding_keys());
         let omnisharded = !is_sharded && shard.is_none();
         let broadcast_null = is_sharded && parser.references_broadcast_null_table();
 
