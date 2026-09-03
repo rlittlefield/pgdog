@@ -39,6 +39,9 @@ pub(crate) struct Orchestrator {
     /// Dump and restore schema without a publication: nothing is
     /// copied or replicated, so no publication is required to exist.
     schema_only: bool,
+    /// Copy and stream only rows for these sharding keys, straight to
+    /// the target shard (MOVE KEYS).
+    key_move: Option<Arc<move_keys::KeyMoveScope>>,
 }
 
 /// A handle to a publication's replication slots, decoupled from the rest of
@@ -80,6 +83,7 @@ impl Orchestrator {
             fixed_destination: false,
             hybrid_tables: vec![],
             schema_only: false,
+            key_move: None,
         };
 
         orchestrator.refresh_publisher();
@@ -111,6 +115,40 @@ impl Orchestrator {
             fixed_destination: true,
             hybrid_tables,
             schema_only: false,
+            key_move: None,
+        };
+        orchestrator.refresh_publisher();
+        orchestrator.with_source_shard(source_shard)
+    }
+
+    /// Create an orchestrator for MOVE KEYS: source and destination
+    /// are the same serving database, the source scoped to the shard
+    /// the keys live on. The copy and the stream carry only the moving
+    /// keys' rows, straight to the target shard. No schema sync: the
+    /// destination shard serves already.
+    // Consumed by the MOVE KEYS task.
+    #[allow(dead_code)]
+    pub(crate) fn for_key_move(
+        database: &str,
+        publication: &str,
+        scope: Arc<move_keys::KeyMoveScope>,
+    ) -> Result<Self, Error> {
+        let source = databases().schema_owner(database)?;
+        let source_shard = scope.source();
+
+        let replication_slot = format!("__pgdog_repl_{}", random_string(19).to_lowercase());
+
+        let mut orchestrator = Self {
+            destination: source.clone(),
+            source,
+            publication: publication.to_owned(),
+            publisher: Arc::new(Mutex::new(Publisher::default())),
+            replication_slot,
+            source_shard: None,
+            fixed_destination: false,
+            hybrid_tables: vec![],
+            schema_only: false,
+            key_move: Some(scope),
         };
         orchestrator.refresh_publisher();
         orchestrator.with_source_shard(source_shard)
@@ -147,8 +185,11 @@ impl Orchestrator {
     /// Replace the publisher entirely (discards LSN state).  Only valid
     /// when starting a fresh replication phase, e.g. after cutover.
     pub(crate) fn refresh_publisher(&mut self) {
-        let publisher = Publisher::new(&self.publication, self.replication_slot.clone())
+        let mut publisher = Publisher::new(&self.publication, self.replication_slot.clone())
             .with_hybrid_tables(self.hybrid_tables.clone());
+        if let Some(scope) = &self.key_move {
+            publisher.set_key_move(scope.clone());
+        }
         self.publisher = Arc::new(Mutex::new(publisher));
     }
 
@@ -611,6 +652,7 @@ mod tests {
                 fixed_destination: false,
                 hybrid_tables: vec![],
                 schema_only: false,
+                key_move: None,
             }
         }
     }
