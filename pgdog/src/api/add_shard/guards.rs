@@ -1,11 +1,8 @@
 //! The Validating phase: everything the task refuses on, and
 //! everything it holds until it ends.
 
-use std::collections::HashSet;
-use std::sync::LazyLock;
 use std::time::Duration;
 
-use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -14,6 +11,7 @@ use tracing::error;
 
 use super::AddShardTask;
 use crate::api::MigrationError;
+use crate::api::topology_guard::TopologyGuard;
 use crate::backend::Cluster;
 use crate::backend::databases::{databases, provisioning_cluster};
 use crate::backend::pool;
@@ -23,35 +21,6 @@ use crate::backend::replication::logical::add_shard::{
 };
 use crate::backend::replication::logical::publisher::HybridNullTable;
 use crate::config::config;
-
-/// Databases with a topology change (ADD SHARD) in flight *in this
-/// process*: a cheap refusal for a second concurrent command here.
-/// Cross-instance exclusion is the advisory lock on the new shard
-/// (see [`provisioning_lock`]), watched by the [`LockWatchdog`].
-static TOPOLOGY_TASKS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
-
-/// Removes the database from the in-flight topology registry on drop.
-struct TopologyGuard {
-    database: String,
-}
-
-impl TopologyGuard {
-    fn acquire(database: &str) -> Result<Self, Error> {
-        let mut tasks = TOPOLOGY_TASKS.lock();
-        if !tasks.insert(database.to_string()) {
-            return Err(Error::TopologyChangeInProgress(database.to_string()));
-        }
-        Ok(Self {
-            database: database.to_string(),
-        })
-    }
-}
-
-impl Drop for TopologyGuard {
-    fn drop(&mut self) {
-        TOPOLOGY_TASKS.lock().remove(&self.database);
-    }
-}
 
 /// Shuts the caller-owned provisioning cluster down on drop.
 struct DestinationGuard(Cluster);
@@ -383,17 +352,5 @@ mod test {
             hybrid_tables(&cluster),
             Err(Error::BroadcastNullUnnamedTable(_))
         ));
-    }
-
-    #[test]
-    fn test_topology_guard_excludes_concurrent_changes() {
-        let guard = TopologyGuard::acquire("guard_test_db").unwrap();
-        assert!(TopologyGuard::acquire("guard_test_db").is_err());
-        // A different database is unaffected.
-        let other = TopologyGuard::acquire("guard_test_other").unwrap();
-        drop(guard);
-        // Released: can acquire again.
-        let _again = TopologyGuard::acquire("guard_test_db").unwrap();
-        drop(other);
     }
 }
