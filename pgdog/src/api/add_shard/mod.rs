@@ -21,12 +21,17 @@
 mod cutover;
 mod guards;
 mod provision;
+mod schema_only;
 
 use std::time::Duration;
 
 use crate::api::task::TaskContext;
 use crate::api::{MigrationError, Task};
+use crate::backend::replication::logical::orchestrator::Orchestrator;
 use pgdog_stats::{AddShardStatus, TaskDefinition};
+
+use guards::Preflight;
+use provision::Publication;
 
 /// Outcome of a cutover attempt.
 enum CutoverOutcome {
@@ -71,9 +76,127 @@ impl Task for AddShardTask {
         "add_shard"
     }
 
-    // Nothing constructs this task yet: the full run loop lands with
-    // the schema-only path and the ADD SHARD admin command.
-    async fn run(self, _ctx: TaskContext<Self>) -> Result<(), MigrationError> {
-        unimplemented!("ADD SHARD run loop lands with the schema-only path")
+    async fn run(self, ctx: TaskContext<Self>) -> Result<(), MigrationError> {
+        // Take the cancellation token so a `STOP_TASK` winds the
+        // children down cooperatively.
+        let token = ctx.cancellation_token();
+
+        // Refuse anything that would corrupt or collide, and take
+        // every lock the task holds until it ends.
+        ctx.set_status(AddShardStatus::Validating);
+        let preflight = guards::preflight(&self).await?;
+
+        // With no omnisharded tables there is nothing to copy or
+        // stream, and no writes to pause: sync the schema and activate.
+        if preflight.omni_tables.is_empty() {
+            return schema_only::run(&self, &ctx, &token, &preflight).await;
+        }
+
+        // Publication for the omni tables; dropped when the task ends
+        // unless the operator owns it.
+        let publication = Publication::ensure(&self, &preflight).await?;
+        let orchestrator = Orchestrator::for_provisioning(
+            &self.database,
+            preflight.destination().clone(),
+            publication.name(),
+            0,
+        )?;
+
+        let result = self
+            .provision_and_cutover(&ctx, &token, orchestrator, &preflight)
+            .await;
+
+        publication.cleanup(&self, result.is_ok()).await;
+        result
+    }
+}
+
+impl AddShardTask {
+    /// Schema, data, catch-up, then the cutover loop: each pass waits
+    /// for catch-up, parks for the operator (unless auto), and
+    /// attempts the cutover; an aborted attempt re-enters at catch-up.
+    /// Replication slots are cleaned up on any error past the pre-data
+    /// schema sync.
+    async fn provision_and_cutover(
+        &self,
+        ctx: &TaskContext<Self>,
+        token: &tokio_util::sync::CancellationToken,
+        orchestrator: Orchestrator,
+        preflight: &Preflight,
+    ) -> Result<(), MigrationError> {
+        // DDL first: no replication slots exist yet, so this stays
+        // outside the cleanup guard.
+        let orchestrator = provision::sync_schema_pre(self, ctx, orchestrator).await?;
+
+        // From here the orchestrator may hold replication slots.
+        let slots = orchestrator.publication_guard();
+        let result: Result<(), MigrationError> = async {
+            let orchestrator = provision::copy_data(self, ctx, orchestrator).await?;
+            // The copy can run for hours: catch a lock lost during it
+            // at the phase boundary. (Losing it mid-copy is contained:
+            // a competing task refuses on the non-empty destination.)
+            preflight.lock_held()?;
+            let orchestrator = provision::sync_schema_post(self, ctx, orchestrator).await?;
+            let mut waiter = provision::replicate(self, ctx, orchestrator).await?;
+
+            // Catch up, then cut over: automatically, or when the
+            // operator says so.
+            loop {
+                provision::wait_for_catch_up(self, token, &waiter, preflight).await?;
+
+                // A cancellation during catch-up stops the task. It
+                // must not fall through into the cutover: auto mode
+                // has no other cancellation check before the swap.
+                if token.is_cancelled() {
+                    return provision::stop_stream(&mut waiter).await;
+                }
+
+                if !self.auto_cutover {
+                    match cutover::park(self, ctx, token, &mut waiter, preflight).await? {
+                        cutover::Parked::CutoverRequested => {}
+                        cutover::Parked::Ended => return Ok(()),
+                    }
+                }
+
+                match cutover::run(self, ctx, &mut waiter, preflight).await? {
+                    CutoverOutcome::Done => return Ok(()),
+                    CutoverOutcome::Aborted => {
+                        ctx.set_status(AddShardStatus::Replicating);
+                    }
+                }
+            }
+        }
+        .await;
+
+        if result.is_err()
+            && let Err(err) = slots.cleanup().await
+        {
+            tracing::warn!("failed to clean up replication slots after add shard: {err}");
+        }
+
+        result
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_status_labels_distinct() {
+        let statuses = [
+            AddShardStatus::Validating,
+            AddShardStatus::SchemaSync,
+            AddShardStatus::SyncingData,
+            AddShardStatus::FinalizingSchema,
+            AddShardStatus::Replicating,
+            AddShardStatus::AwaitingCutover,
+            AddShardStatus::Draining,
+            AddShardStatus::SwappingTopology,
+        ];
+        let labels: HashSet<String> = statuses.iter().map(|s| s.to_string()).collect();
+        assert_eq!(labels.len(), statuses.len());
+        assert!(labels.iter().all(|label| !label.is_empty()));
     }
 }
