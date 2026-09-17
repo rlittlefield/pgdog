@@ -105,7 +105,7 @@ pub(crate) async fn destination_is_empty(cluster: &Cluster) -> Result<(), Error>
 mod test {
     use super::*;
     use crate::frontend::router::sharding::ShardedTable;
-    use pgdog_config::{ConfigAndUsers, DataType};
+    use pgdog_config::{ConfigAndUsers, DataType, TableKind};
 
     fn cluster_with(tables: Vec<ShardedTable>) -> Cluster {
         let mut cluster = Cluster::new_test(&ConfigAndUsers::default());
@@ -153,5 +153,16 @@ mod test {
 
         // No sharded tables at all: nothing to destabilize.
         placement_stable(&cluster_with(vec![])).unwrap();
+    }
+
+    #[test]
+    fn test_hybrid_does_not_exempt_placement() {
+        // hybrid only covers the NULL-key rows; the keyed rows
+        // still move under hash routing, so the table is refused.
+        let hashed_hybrid = ShardedTable {
+            kind: TableKind::Hybrid,
+            ..table()
+        };
+        assert!(placement_stable(&cluster_with(vec![hashed_hybrid])).is_err());
     }
 }
