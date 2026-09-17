@@ -116,6 +116,10 @@ pub(crate) struct Route {
     /// This query is only touching omnisharded tables
     /// and requires special checks to be executed.
     omnisharded: bool,
+    /// This write touches a hybrid (`kind = "hybrid"`) table: its
+    /// NULL-key rows broadcast to every shard, so it pauses during an
+    /// ADD SHARD cutover like an omni write.
+    hybrid_table: bool,
     /// Sharding key lookups that missed the cache while routing.
     /// The query engine resolves them and routes the query again;
     /// the query doesn't execute while any are unresolved.
@@ -255,6 +259,17 @@ impl Route {
         self.omnisharded
     }
 
+    /// Mark the route as touching a hybrid table.
+    pub(crate) fn with_hybrid_table(mut self, hybrid_table: bool) -> Self {
+        self.hybrid_table = hybrid_table;
+        self
+    }
+
+    /// The statement touches a hybrid (`kind = "hybrid"`) table.
+    pub(crate) fn is_hybrid_table(&self) -> bool {
+        self.hybrid_table
+    }
+
     pub(crate) fn is_schema_changed(&self) -> bool {
         self.schema_changed
     }
@@ -275,8 +290,12 @@ impl Route {
     /// Whether an omnisharded write must reach every shard to remain consistent.
     ///
     /// If the database is configured *only* with schema sharding, we don't run any checks.
+    /// A hybrid table's NULL-key writes broadcast like omni writes;
+    /// its keyed writes route to one shard and are exempt.
     pub(crate) fn requires_full_shard_coverage(&self) -> bool {
-        self.is_omnisharded() && self.is_write() && !self.sharded_schema_only
+        (self.is_omnisharded() || (self.hybrid_table && self.is_all_shards()))
+            && self.is_write()
+            && !self.sharded_schema_only
     }
 
     /// Return true if this route requires result set manipulation to
@@ -764,6 +783,26 @@ mod test {
 
         route.set_search_path_driven(true);
         route.sharded_schema_only = true;
+        assert!(!route.requires_full_shard_coverage());
+    }
+
+    #[test]
+    fn test_hybrid_write_coverage() {
+        // NULL-key broadcast write to a flagged table: full coverage.
+        let route = Route::write(ShardWithPriority::new_table(Shard::All)).with_hybrid_table(true);
+        assert!(route.requires_full_shard_coverage());
+
+        // Keyed write routes to one shard: exempt.
+        let route =
+            Route::write(ShardWithPriority::new_table(Shard::Direct(1))).with_hybrid_table(true);
+        assert!(!route.requires_full_shard_coverage());
+
+        // Reads never require coverage.
+        let route = Route::read(ShardWithPriority::new_table(Shard::All)).with_hybrid_table(true);
+        assert!(!route.requires_full_shard_coverage());
+
+        // Broadcast write to an unflagged sharded table: unchanged.
+        let route = Route::write(ShardWithPriority::new_table(Shard::All));
         assert!(!route.requires_full_shard_coverage());
     }
 }
