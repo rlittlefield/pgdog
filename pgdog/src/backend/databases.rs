@@ -287,6 +287,21 @@ pub(crate) async fn cutover(source: &str, destination: &str) -> Result<(), Error
     Ok(())
 }
 
+/// Drop cached sharding key lookup translations for these values in
+/// every cluster serving the database. Clusters are per (user,
+/// database) pair, each with its own cache, so one database can have
+/// several. The next statement using one of the keys re-runs its
+/// lookup query and reads the current placement.
+// Consumed by the MOVE KEYS cutover.
+#[allow(dead_code)]
+pub(crate) fn invalidate_lookup_keys(database: &str, keys: &[String]) {
+    for (user, cluster) in databases().all() {
+        if user.database == database {
+            cluster.invalidate_lookup_keys(keys);
+        }
+    }
+}
+
 /// Build a launched, non-serving one-shard `Cluster` for a shard being
 /// provisioned by `ADD SHARD`, from its `provisioning = true` entry.
 /// Several future shards can be declared at once; `shard` names the
@@ -624,6 +639,7 @@ fn resolve_sharded_table(
         mapping: mapping.flatten(),
         lookup_query: config.lookup_query.clone(),
         lookup_result: config.lookup_result,
+        move_query: config.move_query.clone(),
     }
 }
 
