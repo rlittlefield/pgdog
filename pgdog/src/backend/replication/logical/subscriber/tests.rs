@@ -2686,3 +2686,252 @@ async fn hybrid_delete_applies_unconditionally() {
         0
     );
 }
+
+// ── Hybrid tables under the key-move filter ─────────────────────────
+
+/// FULL-identity hybrid table for MOVE KEYS tests: id BIGINT PK,
+/// tenant_id BIGINT (the nullable sharding key), value TEXT. Hybrid
+/// tables can't put their key in an identity index (nullable), so FULL
+/// is the only identity MOVE KEYS accepts for them.
+fn make_hybrid_move_table() -> Table {
+    Table {
+        publication: "test".to_string(),
+        table: PublicationTable {
+            schema: "public".to_string(),
+            name: "hybrid_move".to_string(),
+            attributes: "".to_string(),
+            parent_schema: "".to_string(),
+            parent_name: "".to_string(),
+        },
+        identity: ReplicaIdentity {
+            oid: Oid(7),
+            identity: "f".to_string(),
+            kind: "r".to_string(),
+        },
+        columns: vec![
+            PublicationTableColumn {
+                oid: 7,
+                name: "id".to_string(),
+                type_oid: Oid(20),
+                identity: false, // FULL: no designated identity columns
+            },
+            PublicationTableColumn {
+                oid: 7,
+                name: "tenant_id".to_string(),
+                type_oid: Oid(20),
+                identity: false,
+            },
+            PublicationTableColumn {
+                oid: 7,
+                name: "value".to_string(),
+                type_oid: Oid(25),
+                identity: false,
+            },
+        ],
+        lsn: Lsn::default(),
+        null_filter_column: None,
+    }
+}
+
+fn hybrid_move_relation(oid: Oid) -> Relation {
+    Relation {
+        oid,
+        namespace: "public".to_string(),
+        name: "hybrid_move".to_string(),
+        replica_identity: b'f' as i8,
+        columns: vec![
+            RelColumn {
+                flag: 0,
+                name: "id".to_string(),
+                oid: Oid(20),
+                type_modifier: -1,
+            },
+            RelColumn {
+                flag: 0,
+                name: "tenant_id".to_string(),
+                oid: Oid(20),
+                type_modifier: -1,
+            },
+            RelColumn {
+                flag: 0,
+                name: "value".to_string(),
+                oid: Oid(25),
+                type_modifier: -1,
+            },
+        ],
+    }
+}
+
+fn hybrid_move_tuple(id: &str, tenant: Option<&str>, value: &str) -> TupleData {
+    TupleData {
+        columns: vec![
+            text_column(id),
+            tenant.map(text_column).unwrap_or_else(null_column),
+            text_column(value),
+        ],
+    }
+}
+
+/// A hybrid table under an active key move: NULL-key (global) rows
+/// skip the filter instead of failing the task, a global row claimed
+/// by a moving key replaces the target's existing copy in place, and a
+/// row released to NULL leaves the target.
+#[tokio::test]
+async fn key_move_hybrid_null_rows() {
+    use crate::backend::replication::logical::move_keys::{KeyMoveScope, MoveTable};
+    use pgdog_config::DataType;
+    use std::sync::Arc;
+
+    let oid = Oid(16396);
+    let id_claimed = random_id(); // global copy on the target, flips to the moving key
+    let id_inserted = random_id(); // NULL insert mid-move: skipped
+    let id_deleted = random_id(); // NULL delete mid-move: skipped, copy stays
+    let id_released = random_id(); // moving-key insert, then flips to NULL
+
+    let mut src = test_server().await; // shard 0: the WAL's origin
+    let mut dst = test_server_pgdog1_db().await; // shard 1: the move target
+    let all = [&id_claimed, &id_inserted, &id_deleted, &id_released];
+    for db in [&mut src, &mut dst] {
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS public.hybrid_move (\
+             id BIGINT PRIMARY KEY, tenant_id BIGINT, value TEXT)",
+        )
+        .await
+        .unwrap();
+        for id in all {
+            db.execute(format!("DELETE FROM public.hybrid_move WHERE id = {}", id))
+                .await
+                .unwrap();
+        }
+        // Global rows exist on every shard, the target included.
+        for id in [&id_claimed, &id_deleted] {
+            db.execute(format!(
+                "INSERT INTO public.hybrid_move (id, tenant_id, value) VALUES ({}, NULL, 'global')",
+                id
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    let scope = KeyMoveScope::new(
+        &["11".to_string()],
+        0,
+        1,
+        vec![MoveTable {
+            schema: "public".into(),
+            name: "hybrid_move".into(),
+            sharding_column: "tenant_id".into(),
+            data_type: DataType::Bigint,
+            hybrid: true,
+        }],
+    )
+    .unwrap();
+    let mut sub = make_subscriber_with_tables_two_databases(
+        vec![make_hybrid_move_table()],
+        OmniOwnership::test(),
+    );
+    sub.set_key_move(Arc::new(scope));
+    sub.connect().await.unwrap();
+
+    sub.handle(begin_copy_data(100)).await.unwrap();
+    sub.handle(xlog_copy_data(hybrid_move_relation(oid).to_bytes()))
+        .await
+        .unwrap();
+
+    // A moving key's insert lands on the target.
+    sub.handle(xlog_copy_data(
+        XLogInsert {
+            oid,
+            tuple_data: hybrid_move_tuple(&id_released, Some("11"), "tenant"),
+        }
+        .to_bytes(),
+    ))
+    .await
+    .unwrap();
+
+    // A global (NULL-key) insert skips: the router broadcast it to the
+    // target directly. Before the hybrid filter this failed the task.
+    sub.handle(xlog_copy_data(
+        XLogInsert {
+            oid,
+            tuple_data: hybrid_move_tuple(&id_inserted, None, "global"),
+        }
+        .to_bytes(),
+    ))
+    .await
+    .unwrap();
+
+    // NULL → moving key: the target's global copy is replaced in
+    // place. A bare insert would hit the copy's primary key.
+    sub.handle(x_update(XLogUpdate {
+        oid,
+        identity: UpdateIdentity::Old(hybrid_move_tuple(&id_claimed, None, "global")),
+        new: hybrid_move_tuple(&id_claimed, Some("11"), "claimed"),
+    }))
+    .await
+    .unwrap();
+
+    // Moving key → NULL: the row leaves the moving set and the target.
+    sub.handle(x_update(XLogUpdate {
+        oid,
+        identity: UpdateIdentity::Old(hybrid_move_tuple(&id_released, Some("11"), "tenant")),
+        new: hybrid_move_tuple(&id_released, None, "released"),
+    }))
+    .await
+    .unwrap();
+
+    // A global row's delete skips; the target's copy stays (the
+    // router's broadcast delete is what removes it there).
+    sub.handle(xlog_copy_data(
+        XLogDelete {
+            oid,
+            key: None,
+            old: Some(hybrid_move_tuple(&id_deleted, None, "global")),
+        }
+        .to_bytes(),
+    ))
+    .await
+    .unwrap();
+
+    let status = sub.handle(commit_copy_data(200)).await.unwrap();
+    assert!(status.is_some());
+
+    assert_eq!(
+        count_where(
+            &mut dst,
+            "public.hybrid_move",
+            &format!(
+                "id = {} AND tenant_id = 11 AND value = 'claimed'",
+                id_claimed
+            ),
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count_row(&mut dst, "public.hybrid_move", &id_claimed).await,
+        1,
+        "claimed row replaced, not duplicated"
+    );
+    assert_eq!(
+        count_row(&mut dst, "public.hybrid_move", &id_inserted).await,
+        0
+    );
+    assert_eq!(
+        count_row(&mut dst, "public.hybrid_move", &id_deleted).await,
+        1
+    );
+    assert_eq!(
+        count_row(&mut dst, "public.hybrid_move", &id_released).await,
+        0
+    );
+
+    for db in [&mut src, &mut dst] {
+        for id in all {
+            db.execute(format!("DELETE FROM public.hybrid_move WHERE id = {}", id))
+                .await
+                .unwrap();
+        }
+    }
+}

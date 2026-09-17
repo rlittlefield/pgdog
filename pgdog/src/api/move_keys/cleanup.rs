@@ -188,6 +188,7 @@ mod test {
             name: name.into(),
             sharding_column: "tenant_id".into(),
             data_type: DataType::Bigint,
+            hybrid: false,
         }
     }
 

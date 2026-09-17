@@ -274,6 +274,15 @@ pub(crate) fn binary_col(data: &[u8]) -> Column {
 }
 
 #[cfg(test)]
+pub(crate) fn null_col() -> Column {
+    Column {
+        identifier: Identifier::Null,
+        len: 0,
+        data: bytes::Bytes::new(),
+    }
+}
+
+#[cfg(test)]
 mod test {
     use super::*;
 
