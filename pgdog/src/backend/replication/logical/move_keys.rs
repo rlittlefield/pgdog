@@ -24,6 +24,10 @@ pub struct MoveTable {
     pub name: String,
     pub sharding_column: String,
     pub data_type: DataType,
+    /// The table is a hybrid: NULL-key rows exist on every shard, so
+    /// a NULL sharding key in the WAL is a legal non-member of the
+    /// moving set, not a broken identity.
+    pub hybrid: bool,
 }
 
 /// Everything a single MOVE KEYS run covers, shared between the copy,
@@ -208,9 +212,11 @@ pub(crate) async fn move_lock(cluster: &Cluster) -> Result<Guard, Error> {
 
 /// Tables bearing a sharding column, resolved on the source shard's
 /// primary: named `[[sharded_tables]]` entries directly, column-only
-/// entries by asking the catalog which tables carry the column. Tables
-/// declared omnisharded are excluded: their writes broadcast and their
-/// rows don't move.
+/// entries by asking the catalog which tables carry the column. Named
+/// rules resolve first, matching the router's precedence: a table
+/// covered by both keeps its named rule's settings (the hybrid kind
+/// lives only there). Tables declared omnisharded are excluded: their
+/// writes broadcast and their rows don't move.
 pub(crate) async fn enumerate_tables(
     cluster: &Cluster,
     source_shard: usize,
@@ -235,8 +241,14 @@ pub(crate) async fn enumerate_tables(
                     name: name.clone(),
                     sharding_column: rule.column.clone(),
                     data_type: rule.data_type,
+                    hybrid: rule.is_hybrid(),
                 });
             }
+        }
+    }
+
+    for rule in cluster.sharded_tables() {
+        if rule.name.is_some() {
             continue;
         }
 
@@ -286,6 +298,9 @@ pub(crate) async fn enumerate_tables(
                     name,
                     sharding_column: rule.column.clone(),
                     data_type: rule.data_type,
+                    // Column-only rules can't be hybrid: the kind
+                    // requires a table name.
+                    hybrid: false,
                 });
             }
         }
@@ -345,9 +360,20 @@ pub(crate) async fn replica_identity_covers_key(
             .map(|value| value == "t" || value == "true")
             .unwrap_or(false);
         if !covered {
-            return Err(Error::KeyMoveIdentityGap {
-                table: format!("\"{}\".\"{}\"", table.schema, table.name),
-                column: table.sharding_column.clone(),
+            let name = format!("\"{}\".\"{}\"", table.schema, table.name);
+            // A hybrid table's key is nullable, so Postgres refuses it
+            // in any identity index: FULL is the only shape that can
+            // cover it. Point the operator straight there.
+            return Err(if table.hybrid {
+                Error::KeyMoveHybridIdentity {
+                    table: name,
+                    column: table.sharding_column.clone(),
+                }
+            } else {
+                Error::KeyMoveIdentityGap {
+                    table: name,
+                    column: table.sharding_column.clone(),
+                }
             });
         }
     }
@@ -503,6 +529,7 @@ mod test {
             name: "orders".into(),
             sharding_column: "tenant_id".into(),
             data_type,
+            hybrid: false,
         }]
     }
 
@@ -561,6 +588,7 @@ mod test {
             name: "users".into(),
             sharding_column: "tenant_id".into(),
             data_type: DataType::Varchar,
+            hybrid: false,
         });
         assert!(KeyMoveScope::new(&["11".into()], 0, 1, mixed).is_err());
         assert!(KeyMoveScope::new(&["11".into()], 0, 1, vec![]).is_err());
