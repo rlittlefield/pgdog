@@ -10,6 +10,8 @@ use crate::backend::replication::logical::Error;
 use crate::backend::schema::sync::SchemaSyncError;
 use task::{TaskError, TaskStorage, TaskWaiter};
 
+#[allow(dead_code)] // TODO: remove once the ADD SHARD admin command lands
+pub(crate) mod add_shard;
 pub(crate) mod copy_data;
 pub(crate) mod cutover_registry;
 pub(crate) mod replication;
