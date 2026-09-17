@@ -6,6 +6,7 @@ pub(crate) mod databases;
 pub(crate) mod disconnect_reason;
 pub(crate) mod error;
 pub(crate) mod fleet;
+pub(crate) mod key_move;
 pub(crate) mod maintenance_mode;
 pub(crate) mod pool;
 pub(crate) mod prepared_statements;
