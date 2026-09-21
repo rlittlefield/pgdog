@@ -401,7 +401,6 @@ pub(crate) fn reclassify_pending(
 /// the caller owns it and must shut it down when done. Uses the
 /// database's `schema_admin` user's credentials, same as the serving
 /// shards.
-#[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
 pub(crate) fn provisioning_cluster(database: &str, shard: usize) -> Result<Cluster, Error> {
     let config = config();
     let general = &config.config.general;
@@ -480,7 +479,6 @@ pub(crate) fn provisioning_cluster(database: &str, shard: usize) -> Result<Clust
 /// `pgdog.config` markers the cutover stamps on every shard are what
 /// restarts and RELOADs converge from.
 /// Used by `ADD SHARD` at the point of no return.
-#[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
 pub(crate) async fn activate_provisioning_shard(database: &str, shard: usize) -> Result<(), Error> {
     {
         let _lock = lock();
