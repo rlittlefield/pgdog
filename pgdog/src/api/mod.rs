@@ -13,10 +13,13 @@ use task::{TaskError, TaskStorage, TaskWaiter};
 pub(crate) mod add_shard;
 pub(crate) mod copy_data;
 pub(crate) mod cutover_registry;
+#[allow(dead_code)] // TODO: remove once the MOVE KEYS admin command lands
+pub(crate) mod move_keys;
 pub(crate) mod replication;
 pub(crate) mod resharding;
 pub(crate) mod schema_sync;
 pub(crate) mod task;
+pub(crate) mod topology_guard;
 
 /// Process-global task registry shared by all `crate::api` task modules.
 static TASKS: LazyLock<TaskStorage> = LazyLock::new(TaskStorage::default);

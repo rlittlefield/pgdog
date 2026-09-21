@@ -61,6 +61,7 @@ pub enum TaskStatus {
     Replication(ReplicationStatus),
     ReplicationSlot(ReplicationSlotStatus),
     AddShard(AddShardStatus),
+    MoveKeys(MoveKeysStatus),
     /// Any other task status that is either doesn't report any status
     /// or is not compatible with other versions of tasks.
     #[default]
@@ -607,6 +608,37 @@ pub enum AddShardStatus {
     Other,
 }
 
+/// Stages of moving keys, reported as the MOVE KEYS task's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MoveKeysStatus {
+    /// Checking that the keys can move and taking the locks.
+    #[display("validating")]
+    Validating,
+    /// Copying the moving keys' rows to the target shard.
+    #[display("syncing data")]
+    SyncingData,
+    /// Streaming changes to keep the copied rows fresh.
+    #[display("replicating")]
+    Replicating,
+    /// Caught up; waiting for an operator `CUTOVER`.
+    #[display("awaiting cutover")]
+    AwaitingCutover,
+    /// Writes for the moving keys paused; draining replication to zero.
+    #[display("draining")]
+    Draining,
+    /// Flipping the keys' placement on every shard.
+    #[display("flipping placement")]
+    Flipping,
+    /// Deleting the moved rows from the source shard.
+    #[display("cleaning up")]
+    CleaningUp,
+    /// A stage this build does not know.
+    #[display("-")]
+    #[serde(other)]
+    Other,
+}
+
 /// The slot one per-shard replication subtask streams from.
 #[derive(Debug, Clone, PartialEq, Display, Serialize, Deserialize, JsonSchema)]
 #[display("{slot} on {host}:{port}/{database_name}")]
@@ -901,6 +933,7 @@ mod test {
                 last_transaction: Some(1_700_000_000_000),
             }),
             TaskStatus::AddShard(AddShardStatus::AwaitingCutover),
+            TaskStatus::MoveKeys(MoveKeysStatus::Flipping),
             TaskStatus::Other,
         ];
 
@@ -919,6 +952,7 @@ mod test {
                 | TaskStatus::Replication(_)
                 | TaskStatus::ReplicationSlot(_)
                 | TaskStatus::AddShard(_)
+                | TaskStatus::MoveKeys(_)
                 | TaskStatus::Other => (),
             }
         }
