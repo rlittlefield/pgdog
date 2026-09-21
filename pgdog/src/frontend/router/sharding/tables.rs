@@ -1,4 +1,4 @@
-use pgdog_config::{DataType, Hasher, LookupResult};
+use pgdog_config::{DataType, Hasher, LookupResult, TableKind};
 use pgdog_vector::Vector;
 
 use crate::{
@@ -15,6 +15,7 @@ pub(crate) struct ShardedTable {
     pub(crate) name: Option<String>,
     pub(crate) schema: Option<String>,
     pub(crate) column: String,
+    pub(crate) kind: TableKind,
     pub(crate) primary: bool,
     pub(crate) centroids: Vec<Vector>,
     pub(crate) data_type: DataType,
@@ -23,6 +24,13 @@ pub(crate) struct ShardedTable {
     pub(crate) mapping: Option<Mapping>,
     pub(crate) lookup_query: Option<String>,
     pub(crate) lookup_result: LookupResult,
+}
+
+impl ShardedTable {
+    /// The table is a hybrid: NULL-key rows exist on every shard.
+    pub(crate) fn is_hybrid(&self) -> bool {
+        self.kind == TableKind::Hybrid
+    }
 }
 
 #[derive(Debug)]

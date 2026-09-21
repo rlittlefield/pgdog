@@ -46,6 +46,25 @@ pub struct ShardedTableConfig {
     #[serde(default)]
     pub primary: bool,
 
+    /// What kind of sharded table this is. A `hybrid` table's sharding
+    /// column is nullable and its NULL-key rows exist identically on
+    /// every shard: ADD SHARD copies them to the new shard and
+    /// replicates their changes until the cutover, cutovers briefly
+    /// pause the table's writes while the topology swaps (like an
+    /// omnisharded table), and MOVE KEYS requires `REPLICA IDENTITY
+    /// FULL` on it, since a nullable column can never be part of an
+    /// identity index.
+    ///
+    /// **Note:** `hybrid` requires `name`. Routing is unchanged:
+    /// statements with a NULL sharding key broadcast to all shards
+    /// whatever the kind. A value-to-NULL key transition whose other
+    /// columns include unchanged TOAST values can't be reconstructed
+    /// from WAL during ADD SHARD and is reported as a missed row.
+    ///
+    /// _Default:_ `sharded`
+    #[serde(default)]
+    pub kind: TableKind,
+
     /// For vector sharding, specify the centroid vectors directly in the configuration.
     ///
     /// <https://docs.pgdog.dev/configuration/pgdog.toml/sharded_tables/#centroids>
@@ -123,6 +142,11 @@ pub struct ShardedTableConfig {
 }
 
 impl ShardedTableConfig {
+    /// The table is a hybrid: NULL-key rows exist on every shard.
+    pub fn is_hybrid(&self) -> bool {
+        self.kind == TableKind::Hybrid
+    }
+
     /// Load centroids from file, if provided.
     ///
     /// Centroids can be very large vectors (1000+ columns).
@@ -551,6 +575,26 @@ impl Display for LookupResult {
         match self {
             Self::Value => write!(f, "value"),
             Self::Shard => write!(f, "shard"),
+        }
+    }
+}
+
+/// Kind of sharded table.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash, Default, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum TableKind {
+    /// Every row lives on the shard its key routes to (default).
+    #[default]
+    Sharded,
+    /// The sharding column is nullable; NULL-key rows exist on every shard.
+    Hybrid,
+}
+
+impl Display for TableKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sharded => write!(f, "sharded"),
+            Self::Hybrid => write!(f, "hybrid"),
         }
     }
 }

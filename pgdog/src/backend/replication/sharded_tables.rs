@@ -181,31 +181,43 @@ impl ShardedTables {
     }
 
     /// Determine if the column is sharded and return its data type,
-    /// as declared in the schema.
+    /// as declared in the schema. Named rules win over column-only
+    /// rules, matching the router's precedence everywhere else: a
+    /// table covered by both must resolve to its named rule's
+    /// settings (`kind`, lookup, mapping).
     pub(crate) fn get_table(&self, column: Column<'_>) -> Option<&ShardedTable> {
         // Only fully-qualified columns can be matched.
         let table = column.table()?;
 
-        for candidate in &self.inner.tables {
+        let matches = |candidate: &&ShardedTable| -> bool {
             if let Some(table_name) = candidate.name.as_ref()
                 && !table.name_match(table_name)
             {
-                continue;
+                return false;
             }
 
             if let Some(schema_name) = candidate.schema.as_ref()
                 && let Some(schema) = table.schema()
                 && schema.name != schema_name
             {
-                continue;
+                return false;
             }
 
-            if column.name == candidate.column {
-                return Some(candidate);
-            }
-        }
+            column.name == candidate.column
+        };
 
-        None
+        self.inner
+            .tables
+            .iter()
+            .filter(|candidate| candidate.name.is_some())
+            .find(matches)
+            .or_else(|| {
+                self.inner
+                    .tables
+                    .iter()
+                    .filter(|candidate| candidate.name.is_none())
+                    .find(matches)
+            })
     }
 }
 

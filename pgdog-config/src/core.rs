@@ -22,7 +22,7 @@ use super::otel::Otel;
 use super::pooling::PoolerMode;
 use super::replication::{MirrorConfig, Mirroring, MirroringLevel, ReplicaLag, Replication};
 use super::rewrite::Rewrite;
-use super::sharding::{OmnishardedTables, ShardedMappingDeprecated};
+use super::sharding::{OmnishardedTables, ShardedMappingDeprecated, TableKind};
 use super::users::{Admin, Plugin, User, Users};
 use super::vault::Vault;
 
@@ -670,6 +670,34 @@ impl Config {
             warn!(
                 "`[[sharded_mappings]]` config is deprecated, use `[[sharded_tables.mapping]]` instead"
             )
+        }
+
+        // A hybrid table needs a name to enumerate it into a
+        // publication, and an omnisharded table already replicates
+        // fully: both demote to a plain sharded table.
+        for table in &mut self.sharded_tables {
+            if !table.is_hybrid() {
+                continue;
+            }
+            let Some(name) = &table.name else {
+                warn!(
+                    r#"sharded table on column "{}" in database "{}" sets kind = "hybrid" without "name", treating it as sharded"#,
+                    table.column, table.database,
+                );
+                table.kind = TableKind::Sharded;
+                continue;
+            };
+            let omni = self
+                .omnisharded_tables
+                .iter()
+                .any(|omni| omni.database == table.database && omni.tables.contains(name));
+            if omni {
+                warn!(
+                    r#"table "{}" in database "{}" is omnisharded, ignoring kind = "hybrid""#,
+                    name, table.database,
+                );
+                table.kind = TableKind::Sharded;
+            }
         }
     }
 
@@ -1746,6 +1774,63 @@ database = "db"
 column = "legacy_id"
 "#;
         assert_mapping_config(&toml::from_str(source).unwrap());
+    }
+
+    #[test]
+    fn test_table_kind_config() {
+        let source = r#"
+[[sharded_tables]]
+database = "db"
+column = "org_id"
+kind = "hybrid"
+
+[[sharded_tables]]
+database = "db"
+name = "packages"
+column = "org_id"
+kind = "hybrid"
+
+[[sharded_tables]]
+database = "db"
+name = "orgs"
+column = "org_id"
+kind = "hybrid"
+
+[[sharded_tables]]
+database = "db"
+name = "orders"
+column = "org_id"
+
+[[omnisharded_tables]]
+database = "db"
+tables = ["orgs"]
+"#;
+        let mut config: Config = toml::from_str(source).unwrap();
+        config.check();
+
+        // Without a name the table can't be enumerated into a
+        // publication: demoted to sharded with a warning.
+        assert!(!config.sharded_tables[0].is_hybrid());
+        // Named, no omni overlap: kept.
+        assert!(config.sharded_tables[1].is_hybrid());
+        // Omnisharded tables already replicate fully: demoted.
+        assert!(!config.sharded_tables[2].is_hybrid());
+        // Defaults to sharded.
+        assert_eq!(config.sharded_tables[3].kind, TableKind::Sharded);
+
+        // The old flag is gone: deny_unknown_fields refuses it loudly.
+        assert!(
+            toml::from_str::<Config>(
+                r#"
+[[sharded_tables]]
+database = "db"
+name = "packages"
+column = "org_id"
+broadcast_null = true
+"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -540,6 +540,32 @@ impl<'a, 'b: 'a, 'c> StatementParser<'a, 'b, 'c> {
         false
     }
 
+    /// Check that the statement references a hybrid (`kind =
+    /// "hybrid"`) table. Writes to these tables pause during an ADD
+    /// SHARD cutover: their NULL-key rows broadcast to every shard,
+    /// including the one being swapped in. Only named configs can be
+    /// hybrid; the schema is honored when configured.
+    pub(crate) fn references_hybrid_table(&mut self) -> bool {
+        let sharded_tables = self.schema.tables.tables();
+        let flagged: Vec<_> = sharded_tables
+            .iter()
+            .filter(|t| t.is_hybrid() && t.name.is_some())
+            .collect();
+        if flagged.is_empty() {
+            return false;
+        }
+
+        self.tables().iter().any(|table| {
+            flagged.iter().any(|config| {
+                config.name.as_deref() == Some(table.name)
+                    && config
+                        .schema
+                        .as_ref()
+                        .is_none_or(|schema| table.schema == Some(schema.as_str()))
+            })
+        })
+    }
+
     /// Extract all tables referenced in the statement.
     pub(crate) fn extract_tables(&self) -> Vec<Table<'a>> {
         self.run_walk().tables
@@ -1094,6 +1120,7 @@ mod test {
     use crate::frontend::router::sharding::{Mapping, ShardedTable};
     use pgdog_config::{
         DataType, FlexibleType, ShardedMappingConfig, ShardedMappingList, SystemCatalogsBehavior,
+        TableKind,
     };
 
     use crate::backend::ShardedTables;
@@ -1161,6 +1188,77 @@ mod test {
         let stmt = raw.stmts().next().unwrap();
         let mut parser = StatementParser::new(stmt, bind.map(Into::into), &schema, None);
         parser.shard()
+    }
+
+    fn hybrid_schema() -> ShardingSchema {
+        ShardingSchema {
+            shards: 3,
+            tables: ShardedTables::new(
+                vec![
+                    ShardedTable {
+                        column: "org_id".into(),
+                        name: Some("packages".into()),
+                        data_type: DataType::Varchar,
+                        kind: TableKind::Hybrid,
+                        ..Default::default()
+                    },
+                    ShardedTable {
+                        column: "org_id".into(),
+                        name: Some("orders".into()),
+                        data_type: DataType::Varchar,
+                        ..Default::default()
+                    },
+                    ShardedTable {
+                        column: "tenant_id".into(),
+                        name: Some("scoped".into()),
+                        schema: Some("myschema".into()),
+                        kind: TableKind::Hybrid,
+                        ..Default::default()
+                    },
+                ],
+                vec![],
+                false,
+                SystemCatalogsBehavior::default(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    fn references_hybrid(stmt: &str) -> bool {
+        let schema = hybrid_schema();
+        let raw = pg_raw_parse::parse(stmt).unwrap();
+        let stmt = raw.stmts().next().unwrap();
+        let mut parser = StatementParser::new(stmt, None, &schema, None);
+        parser.references_hybrid_table()
+    }
+
+    #[test]
+    fn test_references_hybrid_table() {
+        // Every write shape against a flagged table matches — the
+        // marker is deliberately coarse (a keyed INSERT still parks
+        // during the ADD SHARD cutover drain).
+        assert!(references_hybrid(
+            "INSERT INTO packages (id, org_id) VALUES (1, NULL)"
+        ));
+        assert!(references_hybrid(
+            "INSERT INTO packages (id, org_id) VALUES (1, 'org_a')"
+        ));
+        assert!(references_hybrid("INSERT INTO packages (id) VALUES (1)"));
+        assert!(references_hybrid(
+            "UPDATE packages SET name = 'x' WHERE org_id IS NULL"
+        ));
+        assert!(references_hybrid("DELETE FROM packages WHERE id = 5"));
+
+        // Unflagged sharded table: no match.
+        assert!(!references_hybrid(
+            "INSERT INTO orders (id, org_id) VALUES (1, NULL)"
+        ));
+
+        // Schema in the config is honored.
+        assert!(references_hybrid("UPDATE myschema.scoped SET name = 'x'"));
+        assert!(!references_hybrid(
+            "UPDATE otherschema.scoped SET name = 'x'"
+        ));
     }
 
     /// Run the parser on a statement and return the computed shard along
