@@ -93,6 +93,9 @@ use tokio::process::Command;
 pub(crate) struct PgDump {
     source: Cluster,
     publication: String,
+    /// Dump without a publication: schema only, no data phases. The
+    /// publication-table check is skipped.
+    verify_publication: bool,
 }
 
 fn build_pg_dump_command(
@@ -126,6 +129,19 @@ impl PgDump {
         Self {
             source: source.clone(),
             publication: publication.to_string(),
+            verify_publication: true,
+        }
+    }
+
+    /// Dump the schema without consulting any publication. Used by
+    /// ADD SHARD for databases with no omnisharded tables: there is
+    /// nothing to copy or replicate, only DDL to provision.
+    #[allow(dead_code)] // TODO: remove once the ADD SHARD schema-only path lands
+    pub fn schema_only(source: &Cluster) -> Self {
+        Self {
+            source: source.clone(),
+            publication: String::new(),
+            verify_publication: false,
         }
     }
 
@@ -156,32 +172,34 @@ impl PgDump {
             .addr()
             .clone();
 
-        info!(
-            "loading tables from publication \"{}\" on {} shards [{}]",
-            self.publication,
-            self.source.shards().len(),
-            self.source.name(),
-        );
+        if self.verify_publication {
+            info!(
+                "loading tables from publication \"{}\" on {} shards [{}]",
+                self.publication,
+                self.source.shards().len(),
+                self.source.name(),
+            );
 
-        for (num, shard) in self.source.shards().iter().enumerate() {
-            let mut server = shard.primary_or_replica(&Request::default()).await?;
-            let tables = PublicationTable::load(&self.publication, &mut server).await?;
-            if comparison.is_empty() {
-                comparison.extend(tables);
-            } else if comparison != tables {
-                warn!(
-                    "shard {} tables are different [{}, {}]",
-                    num,
-                    server.addr(),
-                    self.source.name()
-                );
+            for (num, shard) in self.source.shards().iter().enumerate() {
+                let mut server = shard.primary_or_replica(&Request::default()).await?;
+                let tables = PublicationTable::load(&self.publication, &mut server).await?;
+                if comparison.is_empty() {
+                    comparison.extend(tables);
+                } else if comparison != tables {
+                    warn!(
+                        "shard {} tables are different [{}, {}]",
+                        num,
+                        server.addr(),
+                        self.source.name()
+                    );
+                }
             }
-        }
 
-        if comparison.is_empty() {
-            return Err(SchemaSyncError::PublicationNoTables(
-                self.publication.clone(),
-            ));
+            if comparison.is_empty() {
+                return Err(SchemaSyncError::PublicationNoTables(
+                    self.publication.clone(),
+                ));
+            }
         }
 
         info!("dumping schema [{}, {}]", comparison.len(), addr,);

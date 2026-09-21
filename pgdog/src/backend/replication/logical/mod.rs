@@ -1,3 +1,5 @@
+#[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
+pub(crate) mod add_shard;
 pub(crate) mod copy_statement;
 pub(crate) mod ee;
 pub(crate) mod error;

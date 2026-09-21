@@ -76,8 +76,55 @@ pub(crate) enum Error {
 
     #[error("router: {0}")]
     Router(#[from] crate::frontend::router::Error),
+
     #[error("sharding key lookup failed: {0}")]
     Lookup(String),
+
+    #[error("no tables to publish")]
+    NoTables,
+
+    #[error("publication \"{0}\" exists with a different table set")]
+    PublicationMismatch(String),
+
+    #[error(
+        "sharded table \"{0}\" is routed by hashing; adding a shard would move its rows. \
+         Use lookup_result = \"shard\" or an explicit mapping, or reshard instead"
+    )]
+    #[allow(dead_code)] // TODO: remove once ADD SHARD guards land
+    PlacementNotStable(String),
+
+    #[error("the new shard is not empty: {0} table(s) exist")]
+    #[allow(dead_code)] // TODO: remove once ADD SHARD guards land
+    DestinationNotEmpty(usize),
+
+    #[error(
+        "the provisioning shard is declared as shard {declared}, but the next shard is {expected}"
+    )]
+    #[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
+    ProvisioningShardNotNext { declared: usize, expected: usize },
+
+    #[error("another pgdog instance is already provisioning this shard")]
+    ProvisioningLocked,
+
+    #[error(
+        "the provisioning lock's session died, releasing the lock to other pgdog instances; rerun ADD SHARD"
+    )]
+    #[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
+    ProvisioningLockLost,
+
+    #[error(
+        "pgdog instance(s) [{0}] haven't registered on the new shard; deploy the config with the provisioning entry everywhere first"
+    )]
+    #[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
+    InstancesNotRegistered(String),
+
+    #[error("pgdog instance(s) [{0}] didn't pause omni writes in time; retry the cutover")]
+    #[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
+    InstancesNotArmed(String),
+
+    #[error("a topology change for database \"{0}\" is already running")]
+    #[allow(dead_code)] // TODO: remove once the ADD SHARD task lands
+    TopologyChangeInProgress(String),
 
     #[error("net: {0}")]
     Net(#[from] crate::net::Error),
