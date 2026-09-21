@@ -145,6 +145,7 @@ mod test {
                 })
                 .collect(),
             lsn: Default::default(),
+            null_filter_column: None,
         }
     }
 

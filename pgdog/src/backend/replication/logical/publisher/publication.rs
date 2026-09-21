@@ -7,7 +7,7 @@
 use tracing::{info, warn};
 
 use super::super::Error;
-use super::queries::PublicationTable;
+use super::queries::{PublicationTable, quote_literal};
 use crate::backend::{Cluster, Server, pool::Request};
 use crate::util::escape_identifier;
 
@@ -63,24 +63,51 @@ pub(crate) async fn create_publication_on(
         }
         // 42710: publication already exists. Verify it matches.
         Err(crate::backend::Error::ExecutionError(response)) if response.code == "42710" => {
-            let mut existing = PublicationTable::load(name, server)
-                .await?
-                .into_iter()
-                .map(|table| table.name)
-                .collect::<Vec<_>>();
-            existing.sort();
-            let mut requested = tables.to_vec();
-            requested.sort();
-
-            if existing == requested {
-                info!("reusing existing publication \"{}\"", name);
-                Ok(())
-            } else {
-                Err(Error::PublicationMismatch(name.to_owned()))
-            }
+            validate_publication_on(server, name, tables).await?;
+            info!("reusing existing publication \"{}\"", name);
+            Ok(())
         }
         Err(err) => Err(err.into()),
     }
+}
+
+/// Verify an existing publication covers exactly the given tables and
+/// carries no row filters: copying and streaming trust the
+/// publication's table list, and a row filter would silently drop rows
+/// they expect.
+pub(crate) async fn validate_publication_on(
+    server: &mut Server,
+    name: &str,
+    tables: &[String],
+) -> Result<(), Error> {
+    let mut existing = PublicationTable::load(name, server)
+        .await?
+        .into_iter()
+        .map(|table| table.name)
+        .collect::<Vec<_>>();
+    existing.sort();
+    let mut requested = tables.to_vec();
+    requested.sort();
+
+    if existing != requested {
+        return Err(Error::PublicationMismatch(name.to_owned()));
+    }
+
+    let filtered: Vec<i64> = server
+        .fetch_all(
+            format!(
+                "SELECT COUNT(*)::bigint FROM pg_publication_tables \
+                 WHERE pubname = {} AND rowfilter IS NOT NULL",
+                quote_literal(name)
+            )
+            .as_str(),
+        )
+        .await?;
+    if filtered.first().copied().unwrap_or_default() > 0 {
+        return Err(Error::PublicationHasRowFilter(name.to_owned()));
+    }
+
+    Ok(())
 }
 
 /// Drop a publication on a shard's primary, best effort: failures are
@@ -163,6 +190,52 @@ mod test {
         drop_publication_on(&mut server, name).await.unwrap();
         server
             .execute_checked("DROP TABLE IF EXISTS pub_omni_a, pub_omni_b")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_validate_refuses_row_filtered_publication() {
+        let mut server = test_server().await;
+        let name = "__pgdog_test_row_filter_pub";
+
+        server
+            .execute_checked(
+                "CREATE TABLE IF NOT EXISTS pub_filtered (id BIGINT PRIMARY KEY, org_id BIGINT)",
+            )
+            .await
+            .unwrap();
+        drop_publication_on(&mut server, name).await.unwrap();
+        server
+            .execute_checked(format!(
+                "CREATE PUBLICATION \"{}\" FOR TABLE pub_filtered WHERE (org_id IS NULL)",
+                name
+            ))
+            .await
+            .unwrap();
+
+        let tables = vec!["pub_filtered".to_string()];
+
+        // The table set matches, but the row filter would silently
+        // drop rows the copy and stream expect.
+        let err = validate_publication_on(&mut server, name, &tables)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::PublicationHasRowFilter(_)));
+
+        // Same publication without the filter validates.
+        drop_publication_on(&mut server, name).await.unwrap();
+        create_publication_on(&mut server, name, &tables)
+            .await
+            .unwrap();
+        validate_publication_on(&mut server, name, &tables)
+            .await
+            .unwrap();
+
+        // Cleanup.
+        drop_publication_on(&mut server, name).await.unwrap();
+        server
+            .execute_checked("DROP TABLE IF EXISTS pub_filtered")
             .await
             .unwrap();
     }
