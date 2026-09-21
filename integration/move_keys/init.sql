@@ -30,6 +30,11 @@ GRANT ALL ON SCHEMA public TO pgdog;
 CREATE TABLE public.orgs (id VARCHAR PRIMARY KEY, shard_id BIGINT NOT NULL);
 CREATE TABLE public.data (id BIGSERIAL, org_id VARCHAR NOT NULL, value TEXT, PRIMARY KEY (id, org_id));
 ALTER SEQUENCE public.data_id_seq RESTART WITH 1 INCREMENT BY 2;
+-- Hybrid table: org_id is nullable, so no identity
+-- index can cover it; FULL is the only identity MOVE KEYS accepts.
+-- Ids are app-supplied so the broadcast copies stay identical.
+CREATE TABLE public.packages (id BIGINT PRIMARY KEY, org_id VARCHAR, value TEXT);
+ALTER TABLE public.packages REPLICA IDENTITY FULL;
 
 -- Reset the pgdog.config marker: a leftover stamp from another suite
 -- (say add_shard's third shard) would disagree with this suite's
@@ -62,6 +67,8 @@ GRANT ALL ON SCHEMA public TO pgdog;
 CREATE TABLE public.orgs (id VARCHAR PRIMARY KEY, shard_id BIGINT NOT NULL);
 CREATE TABLE public.data (id BIGSERIAL, org_id VARCHAR NOT NULL, value TEXT, PRIMARY KEY (id, org_id));
 ALTER SEQUENCE public.data_id_seq RESTART WITH 2 INCREMENT BY 2;
+CREATE TABLE public.packages (id BIGINT PRIMARY KEY, org_id VARCHAR, value TEXT);
+ALTER TABLE public.packages REPLICA IDENTITY FULL;
 
 -- Reset the pgdog.config marker: a leftover stamp from another suite
 -- (say add_shard's third shard) would disagree with this suite's

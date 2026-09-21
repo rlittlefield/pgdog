@@ -180,9 +180,19 @@ pub(crate) struct StreamSubscriber {
 #[derive(Debug)]
 pub(crate) struct KeyMoveFilter {
     scope: Arc<KeyMoveScope>,
-    // Sharding column position per relation OID, registered with each
-    // Relation message.
-    columns: HashMap<Oid, usize>,
+    // Sharding column per relation OID, registered with each Relation
+    // message.
+    columns: HashMap<Oid, KeyColumn>,
+}
+
+/// Where a relation's sharding key sits in its tuples, and how a NULL
+/// there reads.
+#[derive(Debug, Clone, Copy)]
+struct KeyColumn {
+    position: usize,
+    /// The table is a hybrid: a NULL key marks a global row that
+    /// exists on every shard, not a broken identity.
+    hybrid: bool,
 }
 
 /// What to do with one replicated change.
@@ -210,7 +220,13 @@ impl KeyMoveFilter {
                 .iter()
                 .position(|column| column.name == table.sharding_column)
         {
-            self.columns.insert(relation.oid, position);
+            self.columns.insert(
+                relation.oid,
+                KeyColumn {
+                    position,
+                    hybrid: table.hybrid,
+                },
+            );
         }
     }
 
@@ -218,9 +234,12 @@ impl KeyMoveFilter {
     /// its tuple. Every tuple this sees carries the key: identity
     /// tuples do because the preflight guard requires the replica
     /// identity to cover the sharding column, and full tuples always
-    /// do. A missing or unreadable key fails the task rather than
-    /// silently dropping (which could lose a moved row) or applying
-    /// broadly (which could duplicate one).
+    /// do. On a hybrid (`kind = "hybrid"`) table a NULL key is a legal
+    /// value — a global row that never belongs to the moving set, and
+    /// whose writes the router already broadcast to the target — so
+    /// its changes skip. Anywhere else a missing or unreadable key
+    /// fails the task rather than silently dropping (which could lose
+    /// a moved row) or applying broadly (which could duplicate one).
     fn decide(
         &self,
         oid: Oid,
@@ -230,8 +249,8 @@ impl KeyMoveFilter {
     ) -> Result<KeyMoveDecision, Error> {
         let missing = || Error::KeyMoveMissingKey { table: table(), op };
 
-        let position = *self.columns.get(&oid).ok_or_else(missing)?;
-        let column = tuple.columns.get(position).ok_or_else(missing)?;
+        let key = *self.columns.get(&oid).ok_or_else(missing)?;
+        let column = tuple.columns.get(key.position).ok_or_else(missing)?;
         let value = match &column.identifier {
             Identifier::Format(Format::Text) => {
                 let text = std::str::from_utf8(&column.data[..])
@@ -246,6 +265,11 @@ impl KeyMoveFilter {
                     _ => return Err(missing()),
                 }
             }
+            Identifier::Null if key.hybrid => return Ok(KeyMoveDecision::Skip),
+            // An unchanged-TOAST key is stored out of line, hence
+            // non-NULL, but its value isn't in the WAL: refused even on
+            // hybrid tables (keys are bigint/uuid/short varchar and
+            // don't TOAST in practice).
             Identifier::Null | Identifier::Toasted => return Err(missing()),
         };
 
@@ -857,9 +881,15 @@ impl StreamSubscriber {
                         return Ok(());
                     }
                     // The row joined the moving set: insert the new
-                    // version on the target; the old one never lived
-                    // there.
+                    // version on the target. On a hybrid
+                    // table the old version can
+                    // already live there — a NULL-key row exists on
+                    // every shard — so clear it by its old identity
+                    // first; the delete is a no-op (and not a missed
+                    // row) when the row never lived there.
                     (KeyMoveDecision::Skip, KeyMoveDecision::Move) => {
+                        let delete_bind = old_full.to_bind(delete_parse.name());
+                        self.send(&target, delete_bind, false).await?;
                         let insert_bind = complete_new.to_bind(insert_parse.name());
                         self.send(&target, insert_bind, true).await?;
                         self.mark_table_changed(oid);
@@ -1388,11 +1418,15 @@ mod tests {
         use super::super::*;
         use crate::backend::replication::logical::move_keys::{KeyMoveScope, MoveTable};
         use crate::net::messages::replication::logical::tuple_data::{
-            binary_col, text_col, toasted_col,
+            binary_col, null_col, text_col, toasted_col,
         };
         use pgdog_config::DataType;
 
         fn filter(data_type: DataType, keys: &[&str]) -> KeyMoveFilter {
+            filter_for(data_type, keys, false)
+        }
+
+        fn filter_for(data_type: DataType, keys: &[&str], hybrid: bool) -> KeyMoveFilter {
             let keys = keys.iter().map(|k| k.to_string()).collect::<Vec<_>>();
             let scope = KeyMoveScope::new(
                 &keys,
@@ -1403,6 +1437,7 @@ mod tests {
                     name: "orders".into(),
                     sharding_column: "tenant_id".into(),
                     data_type,
+                    hybrid,
                 }],
             )
             .unwrap();
@@ -1492,12 +1527,60 @@ mod tests {
                 Err(Error::KeyMoveMissingKey { .. })
             ));
 
+            // A NULL key on a plain sharded table is a broken identity.
+            let null_key = TupleData {
+                columns: vec![text_col("5"), null_col()],
+            };
+            assert!(matches!(
+                filter.decide(Oid(42), &null_key, table_name(), "DELETE"),
+                Err(Error::KeyMoveMissingKey { .. })
+            ));
+
             // An unregistered relation can't be judged either.
             let tuple = TupleData {
                 columns: vec![text_col("5"), text_col("11")],
             };
             assert!(matches!(
                 filter.decide(Oid(99), &tuple, table_name(), "DELETE"),
+                Err(Error::KeyMoveMissingKey { .. })
+            ));
+        }
+
+        #[test]
+        fn hybrid_null_key_skips() {
+            // On a hybrid table a NULL key is a global
+            // row: never a moving key, so its changes drop instead of
+            // failing the task.
+            let filter = filter_for(DataType::Bigint, &["11"], true);
+
+            let global = TupleData {
+                columns: vec![text_col("5"), null_col()],
+            };
+            assert_eq!(
+                filter
+                    .decide(Oid(42), &global, table_name(), "DELETE")
+                    .unwrap(),
+                KeyMoveDecision::Skip
+            );
+
+            // Keyed rows still judge normally.
+            let moving = TupleData {
+                columns: vec![text_col("5"), text_col("11")],
+            };
+            assert_eq!(
+                filter
+                    .decide(Oid(42), &moving, table_name(), "UPDATE")
+                    .unwrap(),
+                KeyMoveDecision::Move
+            );
+
+            // A toasted key is non-NULL but unreadable: still refused,
+            // hybrid or not.
+            let toasted = TupleData {
+                columns: vec![text_col("5"), toasted_col()],
+            };
+            assert!(matches!(
+                filter.decide(Oid(42), &toasted, table_name(), "UPDATE"),
                 Err(Error::KeyMoveMissingKey { .. })
             ));
         }

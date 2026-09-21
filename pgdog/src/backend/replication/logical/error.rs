@@ -180,6 +180,13 @@ pub(crate) enum Error {
     KeyMoveIdentityGap { table: String, column: String },
 
     #[error(
+        "the replica identity of {table} doesn't cover sharding column \"{column}\", \
+         and a hybrid table's nullable sharding column can't be in an identity index; \
+         run ALTER TABLE {table} REPLICA IDENTITY FULL"
+    )]
+    KeyMoveHybridIdentity { table: String, column: String },
+
+    #[error(
         "the target shard holds rows for the moving keys in {table}, \
          likely from a crashed prior attempt; clean it first: {cleanup}"
     )]

@@ -28,6 +28,22 @@ lookup_query = "SELECT shard_id::text FROM orgs WHERE id = $1"
 lookup_result = "shard"
 move_query = "UPDATE orgs SET shard_id = $2 WHERE id = $1"
 
+#
+# Hybrid table: keyed rows move with their tenant, NULL-key rows exist
+# on every shard and stay put during a move. Listed after the
+# column-only rule on purpose: the named rule must win the enumeration
+# so the hybrid kind reaches the WAL filter.
+#
+[[sharded_tables]]
+database = "pgdog"
+name = "packages"
+column = "org_id"
+data_type = "varchar"
+lookup_query = "SELECT shard_id::text FROM orgs WHERE id = $1"
+lookup_result = "shard"
+move_query = "UPDATE orgs SET shard_id = $2 WHERE id = $1"
+kind = "hybrid"
+
 [[omnisharded_tables]]
 database = "pgdog"
 tables = ["orgs"]

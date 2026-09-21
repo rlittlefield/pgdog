@@ -416,5 +416,55 @@ wait_for_finished "${TASK_ID}" 120
 ON_SOURCE=$(direct pgdog1 "SELECT count(*) FROM data WHERE org_id = 'org_a'")
 assert_eq "${ON_SOURCE}" "0" "rows moved after the retried cutover"
 
+echo "=== Test I: hybrid table moves keyed rows, global rows stay put ==="
+reset_all
+# Global (NULL-key) rows broadcast to every shard; tenant rows live
+# with their tenant. Ids are app-supplied so broadcast copies match.
+app "INSERT INTO packages (id, org_id, value) VALUES (1, NULL, 'global_a'), (2, NULL, 'global_b')" >/dev/null
+app "INSERT INTO packages (id, org_id, value) VALUES (100, 'org_a', 'pkg_a')" >/dev/null
+app "INSERT INTO packages (id, org_id, value) VALUES (101, 'org_c', 'pkg_c')" >/dev/null
+
+# Live traffic on a global row throughout the move: its WAL changes
+# carry a NULL key. Before the hybrid filter, the first one killed the
+# task; the write also has to park at the cutover barrier so the drain
+# can converge.
+{ echo "UPDATE packages SET value = 'touched' WHERE id = 2;"; echo '\watch 0.2'; } | \
+    psql "host=127.0.0.1 port=${PGDOG_PORT} dbname=pgdog user=pgdog password=pgdog" >/dev/null 2>&1 &
+WRITER_PID=$!
+sleep 1
+
+TASK_ID=$(admin "MOVE KEYS pgdog 1 org_a AUTO")
+wait_for_finished "${TASK_ID}" 120
+kill ${WRITER_PID} 2>/dev/null || true
+wait ${WRITER_PID} 2>/dev/null || true
+WRITER_PID=""
+direct pgdog1 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+    WHERE query LIKE '%touched%' AND pid != pg_backend_pid()" >/dev/null || true
+
+# The tenant's rows moved and were cleaned from the source.
+ON_TARGET=$(direct pgdog2 "SELECT count(*) FROM packages WHERE org_id = 'org_a'")
+assert_eq "${ON_TARGET}" "1" "hybrid keyed row moved to the target"
+ON_SOURCE=$(direct pgdog1 "SELECT count(*) FROM packages WHERE org_id = 'org_a'")
+assert_eq "${ON_SOURCE}" "0" "hybrid keyed row deleted from the source"
+
+# The global rows stayed on both shards: the copy skipped them, the
+# WAL filter dropped their changes, and the cleanup left them alone.
+for db in pgdog1 pgdog2; do
+    GLOBALS=$(direct "$db" "SELECT count(*) FROM packages WHERE org_id IS NULL")
+    assert_eq "${GLOBALS}" "2" "global rows intact on ${db}"
+done
+
+# The other tenant's row is untouched.
+OTHER=$(direct pgdog2 "SELECT count(*) FROM packages WHERE org_id = 'org_c'")
+assert_eq "${OTHER}" "1" "non-moving tenant untouched"
+
+# The parked global writes resumed after the flip and broadcast to
+# both shards.
+app "UPDATE packages SET value = 'after_move' WHERE id = 1" >/dev/null
+for db in pgdog1 pgdog2; do
+    AFTER=$(direct "$db" "SELECT count(*) FROM packages WHERE id = 1 AND value = 'after_move'")
+    assert_eq "${AFTER}" "1" "post-move global write broadcast to ${db}"
+done
+
 popd >/dev/null
 echo "move_keys integration tests passed"
