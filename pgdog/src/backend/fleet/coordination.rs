@@ -16,6 +16,7 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::backend::{Cluster, Error};
@@ -105,4 +106,41 @@ pub(crate) struct KeepFresh;
 
 impl Drop for KeepFresh {
     fn drop(&mut self) {}
+}
+
+/// What a coordinated key move covers, riding every state a MOVE KEYS
+/// cutover publishes, as JSON. Followers read it back to pause and
+/// invalidate exactly these keys.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct KeyMovePayload {
+    pub(crate) keys: Vec<String>,
+    pub(crate) source: usize,
+    pub(crate) target: usize,
+}
+
+impl KeyMovePayload {
+    pub(crate) fn to_json(&self) -> Result<String, Error> {
+        serde_json::to_string(self).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()).into()
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_key_move_payload_round_trip() {
+        let payload = KeyMovePayload {
+            keys: vec!["11".into(), "O'Brien".into()],
+            source: 0,
+            target: 2,
+        };
+        let json = payload.to_json().unwrap();
+        let parsed: KeyMovePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.keys, payload.keys);
+        assert_eq!(parsed.source, 0);
+        assert_eq!(parsed.target, 2);
+    }
 }
