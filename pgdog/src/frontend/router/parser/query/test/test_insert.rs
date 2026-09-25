@@ -91,3 +91,24 @@ fn test_insert_default_values() {
     assert!(command.route().is_write());
     assert!(command.route().shard().is_direct());
 }
+
+/// The round-robin fallback for a keyless insert on a plain sharded
+/// table says what happened instead of claiming a key matched.
+#[test]
+fn test_insert_round_robin_explain_label() {
+    let mut test = QueryParserTest::new().with_expanded_explain();
+
+    let command = test.execute(vec![
+        Query::new("EXPLAIN INSERT INTO sharded (value) VALUES ('no key')").into(),
+    ]);
+
+    assert!(matches!(command.route().shard(), Shard::Direct(_)));
+    let lines = command.route().explain().unwrap().render_lines();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("INSERT without a sharding key, shard picked round-robin")),
+        "explain must report the fallback: {:?}",
+        lines
+    );
+}

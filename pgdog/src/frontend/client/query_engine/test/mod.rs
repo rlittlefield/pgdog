@@ -15,6 +15,7 @@ mod close_parse;
 mod close_parse_global_cache;
 mod cross_shard_disabled;
 mod discard;
+mod explain_cross_shard;
 mod extended;
 mod extended_anonymous;
 mod extended_transaction;

@@ -352,6 +352,22 @@ impl Route {
         &self.limit
     }
 
+    /// The route of an `EXPLAIN`: where the statement runs, without the
+    /// result-set processing of the statement it explains. The output is
+    /// plan text, one result per shard, so the inner statement's
+    /// aggregates, ORDER BY, DISTINCT and LIMIT/OFFSET must not be applied
+    /// to it, nor a hybrid table's global-row dedupe to a read's plan
+    /// lines (an `EXPLAIN ANALYZE` of a broadcast write still executes it
+    /// and keeps its shard coverage).
+    pub(crate) fn without_result_processing(mut self) -> Self {
+        self.order_by = Vec::new();
+        self.aggregate = Aggregate::default();
+        self.distinct = None;
+        self.limit = Limit::default();
+        self.projection_rewrite_plan = None;
+        self
+    }
+
     pub(crate) fn set_limit(&mut self, limit: Limit) {
         self.limit = limit;
     }

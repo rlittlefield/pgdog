@@ -287,6 +287,9 @@ pub(crate) struct StatementParser<'a, 'b> {
     /// Added for the ability to try to `shard()` the top-level statement (ignoring any subqueries within)
     /// to see if there's a sharding key or not, to determine solely the top-level's routing
     ignore_subqueries: bool,
+    /// An INSERT had no resolvable sharding key and fell back to a
+    /// round-robin shard; the EXPLAIN label reports it as such.
+    round_robin_fallback: bool,
 }
 
 impl<'a, 'b: 'a> StatementParser<'a, 'b> {
@@ -307,6 +310,7 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
             pending_lookups: Vec::new(),
             resolved_lookups: None,
             ignore_subqueries: false,
+            round_robin_fallback: false,
         }
     }
 
@@ -1229,10 +1233,17 @@ impl<'a, 'b: 'a> StatementParser<'a, 'b> {
         if let Some(table) = ctx.table
             && Tables::new(self.schema).sharded(table).is_some()
         {
+            self.round_robin_fallback = true;
             Ok(Some(Shard::Direct(round_robin::next(self.schema.shards))))
         } else {
             Ok(None)
         }
+    }
+
+    /// The last routed INSERT had no resolvable sharding key and was
+    /// assigned a shard round-robin.
+    pub(crate) fn used_round_robin(&self) -> bool {
+        self.round_robin_fallback
     }
 }
 

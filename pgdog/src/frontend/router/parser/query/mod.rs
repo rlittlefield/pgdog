@@ -677,6 +677,7 @@ impl QueryParser {
         let shard = shard.unwrap_or(Shard::All);
         let pending_lookups = parser.take_pending_lookups();
         context.pending_lookups.extend(pending_lookups);
+        let round_robin = parser.used_round_robin();
 
         context.shards_calculator.push(if is_sharded {
             ShardWithPriority::new_table(shard.clone())
@@ -688,6 +689,10 @@ impl QueryParser {
 
         if let Some(recorder) = self.recorder_mut() {
             match shard.deref() {
+                Shard::Direct(_) if round_robin => recorder.record_entry(
+                    Some(shard.deref().clone()),
+                    "INSERT without a sharding key, shard picked round-robin",
+                ),
                 Shard::Direct(_) => recorder
                     .record_entry(Some(shard.deref().clone()), "INSERT matched sharding key"),
                 Shard::Multi(_) => recorder.record_entry(

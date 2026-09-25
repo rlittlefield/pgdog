@@ -35,6 +35,7 @@ impl QueryParser {
         };
 
         match result {
+            Ok(Command::Query(route)) => Ok(Command::Query(route.without_result_processing())),
             Ok(command) => Ok(command),
             Err(err) => {
                 self.explain_recorder = None;
@@ -241,6 +242,35 @@ mod tests {
         let r = route("EXPLAIN (FORMAT JSON) SELECT * FROM sharded WHERE id = 1");
         assert!(matches!(r.shard(), Shard::Direct(_)));
         assert!(r.is_read());
+    }
+
+    /// The output of an EXPLAIN is plan text, one result per shard: the
+    /// inner statement's aggregates, ORDER BY, DISTINCT and LIMIT/OFFSET
+    /// are not applied to it (merging the "QUERY PLAN" text as a bigint
+    /// count used to close the connection).
+    #[test]
+    fn test_explain_does_not_merge_plan_text_as_the_inner_result() {
+        for sql in [
+            "EXPLAIN SELECT count(*) FROM sharded",
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*), max(id) FROM sharded GROUP BY email",
+            "EXPLAIN SELECT * FROM sharded ORDER BY id LIMIT 1 OFFSET 1",
+            "EXPLAIN SELECT DISTINCT email FROM sharded",
+        ] {
+            let r = route(sql);
+            assert_eq!(r.shard(), &Shard::All, "{sql}");
+            assert!(r.is_read(), "{sql}");
+            assert!(!r.requires_post_processing(), "{sql}");
+            assert!(r.aggregate().is_empty(), "{sql}");
+            assert!(r.order_by().is_empty(), "{sql}");
+            assert!(r.distinct().is_none(), "{sql}");
+            assert!(r.limit().offset.is_none(), "{sql}");
+            assert!(r.projection_rewrite_plan.is_none(), "{sql}");
+        }
+
+        let r = route("EXPLAIN ANALYZE UPDATE sharded SET active = true");
+        assert_eq!(r.shard(), &Shard::All);
+        assert!(r.is_write());
+        assert!(!r.requires_post_processing());
     }
 
     #[test]
