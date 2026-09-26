@@ -78,6 +78,7 @@ fn test_portal_describe_follows_set_sharding_key() {
 
 #[test]
 fn test_dry_run_simple() {
+    Cache::reset();
     let mut test = QueryParserTest::new_single_shard(&config()).with_dry_run();
 
     let command = test.execute(vec![
@@ -436,6 +437,30 @@ fn test_set_key_errors_on_omnisharded_write() {
     assert!(matches!(result, Err(Error::OmniWriteWithDirective)));
 }
 
+/// Under a search_path route a comment key that missed the lookup cache
+/// does not reject the omnisharded write up front: the key resolves
+/// before execution, and the next routing pass rejects the write only
+/// if the comment key overrides search_path.
+#[test]
+fn test_comment_key_omnisharded_write_is_deferred_under_search_path() {
+    use crate::net::parameter::ParameterValue;
+
+    let tables = lookup_rule_tables();
+    let mut test = QueryParserTest::new()
+        .with_sharded_tables(tables)
+        .with_param(
+            "search_path",
+            ParameterValue::Tuple(vec!["shard_0".into(), "public".into()]),
+        );
+    let command = test.execute(vec![
+        Query::new(
+            "/* pgdog_sharding_key: org_child */ INSERT INTO organizations (id, name) VALUES ('org_child', 'child')",
+        )
+        .into(),
+    ]);
+    assert!(command.route().is_write());
+    assert_eq!(command.route().pending_lookups().len(), 1);
+}
 /// Inside a read/write transaction the conservative strategy routes every
 /// statement to the primary, but a read of an omnisharded table is still a
 /// read: pinning it to one shard with a directive is safe (every shard holds

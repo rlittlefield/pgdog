@@ -48,7 +48,11 @@ pub(super) fn trailing_block_comment(q: &str) -> Option<(&str, &str)> {
     let start = "/*";
     let end = "*/";
 
-    let trimmed = q.trim_end_matches(is_edge_whitespace);
+    // Statement-terminating semicolons sit after the comment in the
+    // natural psql form — `SELECT 1 /* pgdog_shard: 0 */;` — and must
+    // not hide it. Only the query's very end is forgiving like this;
+    // a semicolon between comments still stops the scan.
+    let trimmed = q.trim_end_matches(|c| is_edge_whitespace(c) || c == ';');
     let mut first_start: Option<usize> = None;
     let mut cursor = trimmed.len();
 

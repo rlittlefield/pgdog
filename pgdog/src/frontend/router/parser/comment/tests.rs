@@ -130,6 +130,44 @@ fn test_no_role_comment() {
 }
 
 #[test]
+fn test_trailing_comment_with_semicolon() {
+    let schema = test_schema();
+
+    // The natural psql form: the terminator follows the comment.
+    let qac = parse_edge_comment("SELECT 1 /* pgdog_shard: 1 */;", &schema).unwrap();
+    assert_eq!(
+        qac.comment.shard,
+        Some(ShardOrLookup::Shard(Shard::Direct(1)))
+    );
+    assert_eq!(qac.query, "SELECT 1");
+
+    // Whitespace around the semicolon, and more than one of them.
+    let qac = parse_edge_comment("SELECT 1 /* pgdog_shard: 1 */ ;\n", &schema).unwrap();
+    assert_eq!(
+        qac.comment.shard,
+        Some(ShardOrLookup::Shard(Shard::Direct(1)))
+    );
+    let qac = parse_edge_comment("SELECT 1 /* pgdog_shard: 1 */;;", &schema).unwrap();
+    assert_eq!(
+        qac.comment.shard,
+        Some(ShardOrLookup::Shard(Shard::Direct(1)))
+    );
+
+    // Semicolon before the comment keeps working and stays in the query.
+    let qac = parse_edge_comment("SELECT 1; /* pgdog_shard: 1 */", &schema).unwrap();
+    assert_eq!(
+        qac.comment.shard,
+        Some(ShardOrLookup::Shard(Shard::Direct(1)))
+    );
+    assert_eq!(qac.query, "SELECT 1;");
+
+    // A semicolon between trailing comments still stops the scan:
+    // only the last comment is an edge comment then.
+    let qac = parse_edge_comment("SELECT 1 /* pgdog_shard: 1 */; /* hello */", &schema).unwrap();
+    assert_eq!(qac.comment.shard, None);
+}
+
+#[test]
 fn test_remove_comment_leading() {
     let schema = test_schema();
     let qac = parse_edge_comment("/* hello */ SELECT 1", &schema).unwrap();

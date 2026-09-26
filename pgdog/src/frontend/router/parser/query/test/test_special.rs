@@ -99,6 +99,23 @@ fn test_union_all() {
     assert!(command.route().is_read());
 }
 
+/// A keyless set operation has no FROM of its own, but its arms read
+/// sharded tables: it fans out like them instead of going to one shard
+/// round-robin as a table-less SELECT would.
+#[test]
+fn test_keyless_set_operation_routes_by_its_arms() {
+    let mut test = QueryParserTest::new();
+
+    for sql in [
+        "SELECT id FROM sharded UNION ALL SELECT id FROM sharded",
+        "SELECT count(*) FROM sharded UNION ALL SELECT count(*) FROM sharded",
+        "SELECT id FROM sharded EXCEPT SELECT id FROM sharded WHERE value = 'x'",
+    ] {
+        let command = test.execute(vec![Query::new(sql).into()]);
+        assert!(command.route().is_read(), "{sql}");
+        assert_eq!(command.route().shard(), &Shard::All, "{sql}");
+    }
+}
 // --- Aggregate functions ---
 
 #[test]

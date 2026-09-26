@@ -147,7 +147,10 @@ impl QueryParser {
                 // which keys we need to lookup in the routing table.
                 let have_lookups = !context.bare_key_lookups.is_empty();
 
-                if full_shard_coverage && (manual_routing || have_lookups) {
+                // A search_path route defers judgment on pending lookups: the
+                // keys resolve before execution, and the next routing pass
+                // rejects the write if the comment key overrides search_path.
+                if full_shard_coverage && (manual_routing || (have_lookups && !is_search_path)) {
                     return Err(Error::OmniWriteWithDirective);
                 }
 

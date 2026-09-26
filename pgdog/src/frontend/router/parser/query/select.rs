@@ -138,8 +138,13 @@ impl QueryParser {
             shards.insert(shard);
         }
 
-        // SELECT NOW(), SELECT 1
-        if shards.is_empty() && stmt.from_clause().is_empty() {
+        // SELECT NOW(), SELECT 1. A set operation (UNION, INTERSECT,
+        // EXCEPT) has no FROM of its own either, but its arms read
+        // tables: it routes like the tables it reads.
+        if shards.is_empty()
+            && stmt.from_clause().is_empty()
+            && tables.is_some_and(|tables| tables.is_empty())
+        {
             if omnisharded && mutates {
                 // e.g. `WITH ins AS (INSERT INTO omni ... RETURNING id) SELECT 1`.
                 // The write must reach every shard to keep them identical.

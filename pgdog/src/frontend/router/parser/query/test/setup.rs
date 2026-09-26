@@ -29,6 +29,17 @@ pub(crate) struct QueryParserTest {
     pub(crate) parser: QueryParser,
     last_parse: Option<String>,
     resolved_lookups: crate::frontend::router::sharding::ResolvedLookups,
+    // The process-global config as it was before this test replaced
+    // it, put back on drop so tests in the same process start clean.
+    restore_config: Option<ConfigAndUsers>,
+}
+
+impl Drop for QueryParserTest {
+    fn drop(&mut self) {
+        if let Some(previous) = self.restore_config.take() {
+            let _ = config::set(previous);
+        }
+    }
 }
 
 impl QueryParserTest {
@@ -50,6 +61,7 @@ impl QueryParserTest {
             prepared: PreparedStatements::new(),
             last_parse: None,
             resolved_lookups: Default::default(),
+            restore_config: None,
         }
     }
 
@@ -66,6 +78,7 @@ impl QueryParserTest {
             prepared: PreparedStatements::new(),
             last_parse: None,
             resolved_lookups: Default::default(),
+            restore_config: None,
         }
     }
 
@@ -158,20 +171,24 @@ impl QueryParserTest {
     }
 
     /// Enable expanded explain for this test.
-    pub(crate) fn with_expanded_explain(mut self) -> Self {
-        let mut updated = config().deref().clone();
-        updated.config.general.expanded_explain = true;
-        config::set(updated).unwrap();
-        self.cluster = Cluster::new_test(&config());
-        self
+    pub(crate) fn with_expanded_explain(self) -> Self {
+        self.with_general(|general| general.expanded_explain = true)
     }
 
     /// Enable dry run mode for this test.
-    pub(crate) fn with_dry_run(mut self) -> Self {
-        let mut updated = config().deref().clone();
-        updated.config.general.dry_run = true;
+    pub(crate) fn with_dry_run(self) -> Self {
+        self.with_general(|general| general.dry_run = true)
+    }
+
+    /// Replace the process-global config with one whose general
+    /// section is changed by `update`, and rebuild the cluster from
+    /// it. The config found here is restored when the test drops.
+    fn with_general(mut self, update: impl FnOnce(&mut pgdog_config::General)) -> Self {
+        let previous = config().deref().clone();
+        let mut updated = previous.clone();
+        update(&mut updated.config.general);
         config::set(updated).unwrap();
-        // Recreate cluster with the new config
+        self.restore_config.get_or_insert(previous);
         self.cluster = Cluster::new_test(&config());
         self
     }
