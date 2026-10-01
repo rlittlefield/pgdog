@@ -755,9 +755,10 @@ impl Cluster {
         Ok(())
     }
 
-    /// Run a parameterized query on one shard, picked round-robin, and
-    /// return all rows. The answer is only authoritative if every shard
-    /// has the same data, e.g. an omnisharded table.
+    /// Run a parameterized query on the primary of one shard, picked round-robin,
+    /// and return all rows. The answer is only authoritative if every shard has
+    /// the same data, e.g. an omnisharded table. Replicas are never used: the
+    /// callers (sharding-key lookups) need rows committed a moment ago.
     pub(crate) async fn fetch_all_round_robin<T: From<DataRow>>(
         &self,
         query: &str,
@@ -767,7 +768,11 @@ impl Cluster {
             .shards
             .get(round_robin::next(self.shards.len().max(1)))
             .ok_or(crate::backend::pool::Error::NoDatabases)?;
-        let mut server = shard.primary_or_replica(&Request::default()).await?;
+        // The primary, never a replica: a sharding-key lookup must see the row a client
+        // committed a moment ago, and a replica may not have it yet (a new organization
+        // whose settings are written right after it). A primary that cannot be checked out
+        // is an error the caller reports, not a reason to read stale data.
+        let mut server = shard.primary(&Request::default()).await?;
 
         server
             .fetch_all(ServerRequest::parameterized(query, params))
@@ -1239,5 +1244,76 @@ mod test {
 
         cluster.query_parser = QueryParserLevel::Off;
         assert!(!cluster.use_query_parser(&req));
+    }
+}
+
+#[cfg(test)]
+mod shard_view_test {
+    use super::*;
+    use pgdog_config::{ConfigAndUsers, Role};
+
+    /// A sharding-key lookup must see what a client committed a moment ago, so the
+    /// round-robin fetch reads a primary even when a replica is configured, and fails
+    /// rather than read a replica when the primary cannot be checked out. The
+    /// "replica" here is a different database, so a stale answer would be visible.
+    #[tokio::test]
+    async fn test_fetch_all_round_robin_reads_the_primary_only() {
+        use crate::backend::server::test::{test_server, test_server_pgdog1_db};
+
+        let mut primary = test_server().await;
+        let mut replica = test_server_pgdog1_db().await;
+        for (server, value) in [(&mut primary, "primary"), (&mut replica, "replica")] {
+            for sql in [
+                "DROP TABLE IF EXISTS public.lookup_primary_only".to_string(),
+                "CREATE TABLE public.lookup_primary_only (value TEXT)".to_string(),
+                format!("INSERT INTO public.lookup_primary_only VALUES ('{value}')"),
+            ] {
+                server.execute_checked(sql.as_str()).await.unwrap();
+            }
+        }
+
+        let config = ConfigAndUsers::default();
+        let mut cluster = Cluster::new_test(&config);
+        cluster.shards.truncate(1);
+        cluster.shards[0] = Shard::new(ShardConfig {
+            number: 0,
+            primary: Some(&PoolConfig {
+                address: Address::new_test(),
+                config: Config::default(),
+            }),
+            replicas: &[PoolConfig {
+                address: Address {
+                    database_name: "pgdog1".into(),
+                    configured_role: Role::Replica,
+                    ..Address::new_test()
+                },
+                config: Config::default(),
+            }],
+            identifier: cluster.identifier.clone(),
+            lsn_check_interval: Duration::MAX,
+            ..Default::default()
+        });
+        cluster.launch();
+
+        let rows: Vec<String> = cluster
+            .fetch_all_round_robin("SELECT value FROM public.lookup_primary_only", &[])
+            .await
+            .unwrap();
+        assert_eq!(rows, vec!["primary".to_string()]);
+
+        // The primary is gone: an error, never the replica's answer.
+        cluster.shards()[0].primary_pool().unwrap().shutdown();
+        let result = cluster
+            .fetch_all_round_robin::<String>("SELECT value FROM public.lookup_primary_only", &[])
+            .await;
+        assert!(result.is_err(), "a lookup must not fall back to a replica");
+        cluster.shutdown();
+
+        for server in [&mut primary, &mut replica] {
+            server
+                .execute_checked("DROP TABLE public.lookup_primary_only")
+                .await
+                .unwrap();
+        }
     }
 }

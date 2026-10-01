@@ -51,6 +51,48 @@ fn test_advisory_lock_routes_by_lock_id() {
     }
 }
 
+/// A lock id the parser can't compute (a column reference, an expression
+/// over unnest) used to hash as 0 and route to shard 0, fighting the
+/// client's pin. With a direct pin from `SET pgdog.shard` or a comment,
+/// the lock follows the pin; a resolvable id keeps the hash routing.
+#[test]
+fn test_advisory_lock_unresolvable_id_follows_the_pin() {
+    use crate::frontend::router::parser::route::{OverrideReason, ShardSource};
+
+    let unresolvable = "SELECT pg_advisory_xact_lock(1, ordered.key) \
+         FROM (SELECT key FROM unnest(ARRAY[10, 20]) AS key ORDER BY key) AS ordered";
+
+    let mut test = QueryParserTest::new().with_param("pgdog.shard", "1");
+    let command = test.execute(vec![Query::new(unresolvable).into()]);
+    let route = command.route();
+    assert_eq!(route.shard(), &Shard::Direct(1));
+    assert_eq!(route.shard_with_priority().source(), &ShardSource::Set);
+    assert!(route.is_write());
+
+    let mut test = QueryParserTest::new();
+    let command = test.execute(vec![
+        Query::new(format!("/* pgdog_shard: 1 */ {unresolvable}")).into(),
+    ]);
+    assert_eq!(command.route().shard(), &Shard::Direct(1));
+    assert_eq!(
+        command.route().shard_with_priority().source(),
+        &ShardSource::Comment
+    );
+
+    // A resolvable id still hashes, pin or not.
+    let mut test = QueryParserTest::new().with_param("pgdog.shard", "1");
+    let command = test.execute(vec![Query::new("SELECT pg_advisory_xact_lock(606)").into()]);
+    assert_eq!(command.route().shard(), &Shard::Direct(0));
+    assert_eq!(
+        command.route().shard_with_priority().source(),
+        &ShardSource::Override(OverrideReason::AdvisoryLock)
+    );
+
+    // Without a pin the unresolvable id is not the client's problem to route.
+    let mut test = QueryParserTest::new();
+    let command = test.execute(vec![Query::new(unresolvable).into()]);
+    assert!(command.route().is_write());
+}
 #[test]
 fn test_write_functions_prepared() {
     let mut test = QueryParserTest::new();

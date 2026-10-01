@@ -216,6 +216,12 @@ impl Shard {
         Ok(())
     }
 
+    /// The primary's pool, if the shard has one. The load balancer lists replicas
+    /// before the primary, so `pools().first()` is not it.
+    pub(crate) fn primary_pool(&self) -> Option<Pool> {
+        self.lb.primary().cloned()
+    }
+
     /// Get all connection pools.
     pub(crate) fn pools(&self) -> Vec<Pool> {
         self.pools_with_roles()
@@ -477,6 +483,44 @@ mod test {
         assert_eq!(ids.len(), 2);
     }
 
+    /// The load balancer lists replicas before the primary, so the
+    /// primary's pool needs its own accessor; a replica-only shard has none.
+    #[test]
+    fn test_primary_pool_is_the_primary_not_the_first_pool() {
+        let primary = Some(&PoolConfig {
+            address: Address::new_test(),
+            ..Default::default()
+        });
+        let replicas = &[PoolConfig {
+            address: Address {
+                configured_role: Role::Replica,
+                ..Address::new_test()
+            },
+            ..Default::default()
+        }];
+        let identifier = Arc::new(User {
+            user: "pgdog".into(),
+            database: "pgdog".into(),
+        });
+
+        let shard = Shard::new(ShardConfig {
+            primary,
+            replicas,
+            identifier: identifier.clone(),
+            ..Default::default()
+        });
+        let primary_pool = shard.primary_pool().expect("a primary was configured");
+        assert_eq!(primary_pool.addr().configured_role, Role::Primary);
+        assert_eq!(shard.pools_with_roles()[0].0, Role::Replica);
+        assert_ne!(primary_pool.id(), shard.pools()[0].id());
+
+        let shard = Shard::new(ShardConfig {
+            replicas,
+            identifier,
+            ..Default::default()
+        });
+        assert!(shard.primary_pool().is_none());
+    }
     #[test]
     fn test_auto_mode_is_read_ready_while_primary_election_is_pending() {
         let replicas = &[PoolConfig {

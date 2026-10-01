@@ -49,6 +49,32 @@ impl QueryParser {
                 .map(|adv_lock| adv_lock.unlock_all)
                 .unwrap_or(false);
 
+            // A lock id the parser can't compute (a column reference, an
+            // expression over unnest) hashes as 0 and would route to
+            // shard 0 — fighting an explicit pin or routing comment and
+            // failing pinned transactions on every other shard. The
+            // client's own routing wins instead: every caller taking an
+            // org-scoped lock carries the same pin, so they still meet
+            // on one shard. Resolvable ids keep the hash override.
+            let unresolved = advisory_locks
+                .iter()
+                .any(|lock| lock.id.is_none() && !lock.unlock_all);
+            let client_pinned = matches!(
+                context.shards_calculator.peek(),
+                Some(pinned)
+                    if matches!(pinned.source(), ShardSource::Set | ShardSource::Comment)
+                        && pinned.is_direct()
+            );
+            if unresolved && !unlock_all && client_pinned {
+                return Ok(Command::Query(
+                    Route::read(context.shards_calculator.shard().clone())
+                        .with_read(false)
+                        .with_mutates(true)
+                        .with_omnisharded(omnisharded)
+                        .with_advisory_locks(advisory_locks),
+                ));
+            }
+
             let shard_override = if unlock_all {
                 // pg_advisory_unlock_all
                 ShardWithPriority::new_override_cross_shard_function()
